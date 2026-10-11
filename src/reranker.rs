@@ -41,6 +41,7 @@ fn session(config: &MindConfig) -> Result<&'static Mutex<Session>> {
                 model_path.display()
             );
         }
+        crate::embedder::require_ort()?;
         let mut builder = Session::builder()
             .map_err(|e| anyhow!("rerank session builder: {e}"))?
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)

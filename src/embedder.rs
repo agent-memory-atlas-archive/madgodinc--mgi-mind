@@ -33,6 +33,7 @@ fn session(config: &MindConfig) -> Result<&'static Mutex<Session>> {
                 model_path.display()
             );
         }
+        require_ort()?;
         let mut builder = Session::builder()
             .map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
@@ -540,6 +541,25 @@ fn ort_lib_path() -> std::path::PathBuf {
     exe.parent()
         .unwrap_or(std::path::Path::new("."))
         .join(ort_lib_name())
+}
+
+/// Fails fast when ONNX Runtime cannot be found. Without it `ort`'s
+/// load-dynamic falls back to the bare library name, and when that misses the
+/// first session build never returns: the CLI hung at 0% CPU (tyan,
+/// 2026-10-11) instead of saying what was wrong.
+pub fn require_ort() -> Result<()> {
+    match std::env::var_os("ORT_DYLIB_PATH") {
+        Some(p) if !Path::new(&p).is_file() => anyhow::bail!(
+            "ORT_DYLIB_PATH points at {}, which does not exist",
+            Path::new(&p).display()
+        ),
+        Some(_) => Ok(()),
+        None if ort_lib_path().is_file() => Ok(()),
+        None => anyhow::bail!(
+            "ONNX Runtime not found: put {} next to mgimind or set ORT_DYLIB_PATH to it",
+            ort_lib_name()
+        ),
+    }
 }
 
 pub fn is_ort_available() -> bool {
