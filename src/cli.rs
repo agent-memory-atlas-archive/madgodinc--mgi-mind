@@ -4214,17 +4214,34 @@ fn spawn_qdrant_detached() -> Result<u32> {
             "QDRANT__STORAGE__STORAGE_PATH",
             data_dir.join("storage").to_string_lossy().to_string(),
         )
+        // Snapshots default to ./snapshots under whatever directory started
+        // us; keep them next to the storage instead.
+        .env(
+            "QDRANT__STORAGE__SNAPSHOTS_PATH",
+            data_dir.join("snapshots").to_string_lossy().to_string(),
+        )
+        .current_dir(&data_dir)
         .env("QDRANT__LOG_LEVEL", "WARN")
         // Bind to loopback only - never expose Qdrant on all interfaces (audit #7).
         .env("QDRANT__SERVICE__HOST", "127.0.0.1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    // Optional API-key authentication (audit #7).
-    if let Ok(cfg) = crate::config::load_cached()
-        && let Some(key) = cfg.qdrant_api_key
-    {
-        command.env("QDRANT__SERVICE__API_KEY", key);
+    if let Ok(cfg) = crate::config::load_cached() {
+        // Listen where the client will look: `qdrant_port` is the gRPC port and
+        // HTTP sits one below it (6333/6334 by default). Without this a second
+        // brain on the same machine (an app embedding its own) collides with the
+        // first on Qdrant's built-in defaults.
+        command
+            .env("QDRANT__SERVICE__GRPC_PORT", cfg.qdrant_port.to_string())
+            .env(
+                "QDRANT__SERVICE__HTTP_PORT",
+                cfg.qdrant_port.saturating_sub(1).to_string(),
+            );
+        // Optional API-key authentication (audit #7).
+        if let Some(key) = cfg.qdrant_api_key {
+            command.env("QDRANT__SERVICE__API_KEY", key);
+        }
     }
 
     // Detach from the parent's process group / console.

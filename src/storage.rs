@@ -313,6 +313,39 @@ pub async fn get_client(config: &MindConfig) -> Result<Arc<Qdrant>> {
         .cloned()
 }
 
+/// The fragments a memory is stored as, each with the overlap it carries.
+/// Trimming the STORED chunk (not just testing the trimmed length) is what keeps
+/// the content-addressed id trim-stable: `deterministic_id` of a stored chunk then
+/// matches `quarantine_id_for` and `live_memory_exists`, which both trim. Skip it
+/// and a whitespace-padded re-assertion lands on a different id and dodges the
+/// dedup/re-assertion guards entirely. Trimming can eat into the head that was
+/// copied from the previous chunk, so the overlap is recomputed against the
+/// trimmed text rather than taken from the splitter raw.
+fn stored_chunks(content: &str) -> (Vec<String>, Vec<usize>) {
+    chunk_text_with_overlap(content, CHUNK_CHARS)
+        .into_iter()
+        .map(|(c, carried)| {
+            let front_trimmed = c.chars().count() - c.trim_start().chars().count();
+            let trimmed = c.trim().to_string();
+            let overlap = carried
+                .saturating_sub(front_trimmed)
+                .min(trimmed.chars().count());
+            (trimmed, overlap)
+        })
+        .filter(|(c, _)| c.chars().count() >= 3)
+        .unzip()
+}
+
+/// The ids `add_memory` gives `content` in `library`, one per stored fragment,
+/// so an API caller can address what it just wrote.
+pub fn memory_ids(library: &str, content: &str) -> Vec<String> {
+    stored_chunks(content)
+        .0
+        .iter()
+        .map(|c| deterministic_id(library, c))
+        .collect()
+}
+
 fn deterministic_id(library: &str, content: &str) -> String {
     let key = format!("{library}\u{0}{content}");
     Uuid::new_v5(&MGI_NAMESPACE, key.as_bytes()).to_string()
@@ -1354,28 +1387,7 @@ pub async fn add_memory_authored(
     ensure_memories_collection(&client, config.vector_size).await?;
     tracing::debug!(library, "add_memory: ensure_memories_collection done");
 
-    // Chunk, trimming each fragment and dropping trivially short ones. Trimming
-    // the STORED chunk (not just testing the trimmed length) is what keeps the
-    // content-addressed id trim-stable: `deterministic_id` of a stored chunk then
-    // matches `quarantine_id_for` and `live_memory_exists`, which both trim. Skip
-    // it and a whitespace-padded re-assertion lands on a different id and dodges
-    // the dedup/re-assertion guards entirely.
-    // Carry each fragment's overlap alongside it. Trimming can eat into the head
-    // that was copied from the previous chunk, so the number that gets stored is
-    // recomputed against the trimmed text rather than taken from the splitter raw.
-    let (chunks, overlaps): (Vec<String>, Vec<usize>) =
-        chunk_text_with_overlap(content, CHUNK_CHARS)
-            .into_iter()
-            .map(|(c, carried)| {
-                let front_trimmed = c.chars().count() - c.trim_start().chars().count();
-                let trimmed = c.trim().to_string();
-                let overlap = carried
-                    .saturating_sub(front_trimmed)
-                    .min(trimmed.chars().count());
-                (trimmed, overlap)
-            })
-            .filter(|(c, _)| c.chars().count() >= 3)
-            .unzip();
+    let (chunks, overlaps) = stored_chunks(content);
     if chunks.is_empty() {
         return Ok(0);
     }
@@ -5682,5 +5694,27 @@ mod tests {
 
         unsafe { std::env::remove_var("MGIMIND_HOME") };
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod memory_ids_tests {
+    use super::*;
+
+    #[test]
+    fn ids_match_what_add_memory_stores() {
+        // trimmed, one fragment: the same id the write path computes
+        assert_eq!(
+            memory_ids("user", "  Любит кошек  "),
+            vec![deterministic_id("user", "Любит кошек")]
+        );
+        // long text: one id per fragment, all distinct
+        let long = "Слово. ".repeat(200);
+        let ids = memory_ids("user", &long);
+        assert!(ids.len() > 1);
+        assert_eq!(
+            ids.len(),
+            ids.iter().collect::<std::collections::HashSet<_>>().len()
+        );
     }
 }

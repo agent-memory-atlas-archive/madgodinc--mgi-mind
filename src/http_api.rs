@@ -145,6 +145,9 @@ pub async fn run(
         .route("/quarantine/list", post(quarantine_list))
         .route("/quarantine/promote", post(quarantine_promote))
         .route("/memory/restore", post(memory_restore))
+        .route("/memory/archive", post(memory_archive))
+        .route("/memory/delete", post(memory_delete))
+        .route("/memory/edit", post(memory_edit))
         .route("/session/start", post(session_start))
         .route("/session/end", post(session_end))
         .route("/session/last", post(session_last))
@@ -844,7 +847,107 @@ async fn memory_add(
     if let Some(resp) = check_write_quota(&state, &who) {
         return resp;
     }
+    // `format: "json"` writes directly and answers with the new ids, so an app
+    // can edit or archive exactly what it wrote. The default keeps the MCP path.
+    if args.get("format").and_then(|f| f.as_str()) == Some("json") {
+        return add_json(&state, &args, derived).await;
+    }
     call(&state, "mind_add", with_agent(args, &headers, derived)).await
+}
+
+async fn add_json(state: &AppState, args: &Value, author: Option<String>) -> Response {
+    let Some(library) = args.get("library").and_then(|v| v.as_str()) else {
+        return bad_request("library is required");
+    };
+    let Some(content) = args.get("content").and_then(|v| v.as_str()) else {
+        return bad_request("content is required");
+    };
+    let source = args.get("source").and_then(|v| v.as_str());
+    match crate::storage::add_memory_authored(
+        &state.config,
+        library,
+        content,
+        source,
+        author.as_deref(),
+    )
+    .await
+    {
+        Ok(_) => Json(json!({ "ok": true, "ids": crate::storage::memory_ids(library, content) }))
+            .into_response(),
+        Err(e) => bad_request(&format!("{e:#}")),
+    }
+}
+
+/// The non-empty `ids` array of a request body.
+fn ids_arg(args: &Value) -> Option<Vec<String>> {
+    let ids: Vec<String> = args
+        .get("ids")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// Soft-forget by id: out of search, restorable with /memory/restore.
+async fn memory_archive(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(args): Json<Value>,
+) -> Response {
+    if let Err(c) = check_auth(&state, &headers) {
+        return c.into_response();
+    }
+    let Some(ids) = ids_arg(&args) else {
+        return bad_request("ids is required");
+    };
+    match crate::storage::archive_memories(&state.config, &ids).await {
+        Ok(n) => Json(json!({ "ok": true, "archived": n })).into_response(),
+        Err(e) => bad_request(&format!("{e:#}")),
+    }
+}
+
+/// Gone for good, by id.
+async fn memory_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(args): Json<Value>,
+) -> Response {
+    if let Err(c) = check_auth(&state, &headers) {
+        return c.into_response();
+    }
+    let Some(ids) = ids_arg(&args) else {
+        return bad_request("ids is required");
+    };
+    match crate::storage::delete_memories(&state.config, &ids).await {
+        Ok(()) => Json(json!({ "ok": true, "deleted": ids.len() })).into_response(),
+        Err(e) => bad_request(&format!("{e:#}")),
+    }
+}
+
+/// New text for a memory. Ids are content-addressed, so the answer carries the
+/// memory's new id.
+async fn memory_edit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(args): Json<Value>,
+) -> Response {
+    if let Err(c) = check_auth(&state, &headers) {
+        return c.into_response();
+    }
+    let (Some(id), Some(content)) = (
+        args.get("id").and_then(|v| v.as_str()),
+        args.get("content").and_then(|v| v.as_str()),
+    ) else {
+        return bad_request("id and content are required");
+    };
+    match crate::storage::edit_memory(&state.config, id, content).await {
+        Ok(new_id) => Json(json!({ "ok": true, "id": new_id })).into_response(),
+        Err(e) => bad_request(&format!("{e:#}")),
+    }
 }
 
 async fn memory_ingest(
