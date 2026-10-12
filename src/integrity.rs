@@ -24,10 +24,37 @@ pub const QDRANT_LINUX_X64_1_18_1: &str =
     "e359f322a65eb6662bf5ad12ae2228bc94fde77761461c4179ba12f137b8c76d";
 /// Qdrant server archive - linux x64 (musl), v1.18.1.
 ///
-/// Statically linked, no glibc dependency. Default for `doctor --fix` on Linux
-/// x64 so the bundled Qdrant works on Ubuntu 22.04 LTS, Debian 12, etc.
+/// Statically linked, no glibc dependency. Superseded by the v1.19.2 pin below
+/// (see that constant's doc comment for why); kept only because the comment at
+/// the top of this file promises these names stay around for anything that
+/// picked them up historically.
 pub const QDRANT_LINUX_X64_1_18_1_MUSL: &str =
     "4df4cdfa9db20fcb49b470b35d0d001a9c4ec7ac28bfb3df4f24545524271e67";
+
+/// Qdrant server archive - linux x64 (gnu), v1.19.2. See
+/// `QDRANT_LINUX_X64_1_19_2_MUSL` for why the pin moved off v1.18.1.
+pub const QDRANT_LINUX_X64_1_19_2: &str =
+    "34a788a09a4cb278b5c6d2af96d9a6db30c8c7e88ae3550455f7a4d425bb8d4b";
+/// Qdrant server archive - linux x64 (musl), v1.19.2.
+///
+/// Statically linked, no glibc dependency. Default for `doctor --fix` on Linux
+/// x64 so the bundled Qdrant works on Ubuntu 22.04 LTS, Debian 12, etc.
+///
+/// Moved off v1.18.1 (2026-10-12): that version reproducibly fails to recover
+/// a snapshot on Windows ("failed to sync file ... os error 5" during WAL
+/// replay in the recovery tmp dir - confirmed live, A/B against v1.19.2 on the
+/// same machine, same storage path, same backup archive). v1.19.0 shipped
+/// "Fix drive letter parsing in Windows snapshot mappings" plus several
+/// payload-index/segment-flush race fixes that match the symptom; v1.19.2
+/// adds "Prevent write tearing in all Gridstore storages". One pin covers
+/// every platform mgimind downloads for, so the Linux pins move with it even
+/// though the reproduced bug was Windows-only.
+pub const QDRANT_LINUX_X64_1_19_2_MUSL: &str =
+    "50b253243309ed0ae50a19f678f0d0adcc4f0b567b3bd2c5c0c7e02fa8404bb6";
+/// Qdrant server archive - windows x64 (msvc), v1.19.2. First Windows pin;
+/// previously this platform downloaded with no integrity check at all.
+pub const QDRANT_WINDOWS_X64_1_19_2: &str =
+    "7d86596f16c6e85d45a50312f5e16ccb51e059b62e3d7308110cb65b4c799a4d";
 /// Legacy embedding model (sentence-transformers/all-MiniLM-L6-v2) ONNX weights.
 pub const MODEL_MINILM_ONNX: &str =
     "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452";
@@ -126,8 +153,8 @@ mod tests {
             RERANK_BGE_BASE_ONNX,
             RERANK_BGE_BASE_TOKENIZER,
             ORT_LINUX_X64_1_24_2,
-            QDRANT_LINUX_X64_1_18_1,
-            QDRANT_LINUX_X64_1_18_1_MUSL,
+            QDRANT_LINUX_X64_1_19_2_MUSL,
+            QDRANT_WINDOWS_X64_1_19_2,
         ] {
             assert!(pin(h).is_some(), "default artifact must be pinned");
             assert_eq!(h.len(), 64, "sha256 hex must be 64 chars");

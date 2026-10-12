@@ -2155,22 +2155,14 @@ async fn backup_and_restore_round_trip_facts_through_qdrant_snapshots() {
     );
 
     // The actual upload-and-recover call is Qdrant's own server-side
-    // operation, not mgimind's - our part ends at the multipart POST. On
-    // Windows, Qdrant 1.18.1's recovery routine reproducibly fails this exact
-    // sequence (confirmed on a clean store, with Defender excluded, with a
-    // delay before the upload) with `failed to sync file ... (os error 5)` on
-    // a WAL-replay file inside its own recovery tmp dir - a Qdrant-on-Windows
-    // limitation, not a path our restore code controls. Skip the destructive
-    // assertion there instead of marking Windows CI red for an upstream bug;
-    // the snapshot-format assertion above still runs on every OS.
-    if cfg!(windows) {
-        eprintln!(
-            "SKIP (windows): Qdrant 1.18.1's snapshot recovery hits an internal \
-             file-sync access-denied error on Windows - see the comment above this line"
-        );
-        return;
-    }
-
+    // operation, not mgimind's - our part ends at the multipart POST. This
+    // used to be skipped unconditionally on Windows: Qdrant 1.18.1's recovery
+    // routine reproducibly failed this exact sequence with `failed to sync
+    // file ... (os error 5)` on a WAL-replay file inside its own recovery tmp
+    // dir. 2026-10-12: re-confirmed live (A/B, same backup archive and
+    // storage path, only the Qdrant binary swapped) and fixed by the version
+    // bump to 1.19.2 in cli.rs's `QDRANT_VERSION` - restore now succeeds on
+    // Windows too, so the assertion below runs on every OS.
     run(&["restore", archive]);
 
     let restored = run(&["fact", "query", &subject]);
