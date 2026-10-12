@@ -72,15 +72,19 @@ Copy the dozen lines you need.
 ## The HTTP surface
 
 An HTTP-only agent reaches the same memory an MCP agent does. Every route takes
-a bearer token; reads and non-destructive writes are exposed, destructive/bulk
-tools (delete, export, import-apply, vault, `consolidate --apply`) stay CLI-only.
+a bearer token; reads and writes by id (archive, delete, edit) are exposed,
+bulk/CLI-grade tools (export, import-apply, vault, `consolidate --apply`) stay
+CLI-only.
 
 | Route | Does |
 |-------|------|
 | `POST /memory/search` | semantic search, with metadata filters |
 | `POST /memory/browse` | list by metadata, no query (inventory) |
 | `POST /memory/recall` | facts + memories + procedures in one call |
-| `POST /memory/add` `/memory/ingest` | write |
+| `POST /memory/add` `/memory/ingest` | write. `format: "json"` on `/memory/add` writes directly and answers `{ok, ids}` so the caller can address what it just wrote |
+| `POST /memory/restore` | undo a soft-forget: `{id}` (singular) |
+| `POST /memory/archive` `/memory/delete` | soft/hard-forget: `{ids: [...]}` (plural, batch) |
+| `POST /memory/edit` | replace a memory's content: `{id, content}`; answers the new (content-addressed) `id` |
 | `POST /memory/by-agent` | what one agent wrote |
 | `POST /fact/add` `/fact/query` `/fact/invalidate` | knowledge-graph triples |
 | `POST /procedure/learn` `/procedure/recall` | error→fix playbooks |
@@ -92,9 +96,12 @@ tools (delete, export, import-apply, vault, `consolidate --apply`) stay CLI-only
 Search and browse return structured JSON by default; pass `format: "text"` for a
 rendered block. See [`raw_http.py`](./raw_http.py) for the request shape.
 
-Outbound fetch (`mind_web`) and destructive ops (delete, export, vault,
-`consolidate --apply`) stay CLI/MCP-only by design: a token-gated loopback fetch
-would make the server an SSRF deputy, and an HTTP agent has its own network.
+`/memory/archive`, `/memory/delete` and `/memory/edit` are fail-closed to a
+library-scoped token (403: the v2.0 library ACL can't yet confine a by-id
+operation to one library) — only an unscoped (full-access) token may reach
+them. Outbound fetch (`mind_web`) and the remaining bulk/CLI tools stay
+CLI/MCP-only by design: a token-gated loopback fetch would make the server an
+SSRF deputy, and an HTTP agent has its own network.
 
 ## Why no per-framework package
 

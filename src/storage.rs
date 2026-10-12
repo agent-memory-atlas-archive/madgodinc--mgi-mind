@@ -699,6 +699,27 @@ pub(crate) async fn create_vectorless_collection(client: &Qdrant, name: &str) ->
 /// Create the payload indexes the single-collection layout relies on (audit #18):
 /// `library` (keyword) for fast per-library filtering, `created_at` (datetime)
 /// for `order_by` in `history`. Idempotent - "already exists" errors are ignored.
+///
+/// `.wait(true)` for consistency with every other write in this file (and so a
+/// failure surfaces on this call instead of on whatever runs next).
+///
+/// 2026-10-12 investigation note: an earlier polish pass reported that
+/// creating a `datetime`/numeric field index on Qdrant 1.18.1-on-Windows fails
+/// outright ("failed to open mutable numeric index on gridstore: ... os error
+/// 3"), with the claimed fallout being `order_by("created_at")` 400s ("No
+/// range index") on `history`, `quarantine list` and `/memory/by-agent`. A
+/// follow-up investigation could NOT reproduce that failure after ~20
+/// attempts (raw REST, the real gRPC path via `fact add`, with and without
+/// existing data, under a rapid create/delete stress loop, immediately after
+/// process spawn) on the same pinned 1.18.1 Windows binary - it may have been
+/// a one-off on that machine at that moment rather than the deterministic bug
+/// it was reported as. What IS confirmed and fixed is the sibling bug below
+/// (`ensure_facts_indexes`'s doc comment): Qdrant 1.18.1 reproducibly fails to
+/// *restore* a Windows snapshot. `QDRANT_VERSION` in cli.rs is now 1.19.2,
+/// which also carries payload-index/segment-flush race fixes that match this
+/// index-creation symptom even though it could not be triggered on demand. If
+/// this resurfaces on 1.19.2+, it needs a fresh raw-REST repro before further
+/// action - do not assume this comment's original claim without one.
 async fn ensure_payload_indexes(client: &Qdrant, collection: &str) {
     for (field, ty) in [
         ("library", FieldType::Keyword),
@@ -724,9 +745,9 @@ async fn ensure_payload_indexes(client: &Qdrant, collection: &str) {
     ] {
         tracing::debug!(collection, field, "ensure_payload_index: start");
         match client
-            .create_field_index(CreateFieldIndexCollectionBuilder::new(
-                collection, field, ty,
-            ))
+            .create_field_index(
+                CreateFieldIndexCollectionBuilder::new(collection, field, ty).wait(true),
+            )
             .await
         {
             Ok(_) => tracing::debug!(collection, field, "ensure_payload_index: ok"),
@@ -812,7 +833,13 @@ pub async fn ensure_memories_collection(client: &Qdrant, dim: u64) -> Result<()>
 /// subject/predicate/object so `query_facts` filters server-side instead of
 /// scrolling everything into RAM; keyword on `valid` for the validity filter;
 /// datetime on `created_at` so the context briefing can `order_by` newest. All
-/// idempotent.
+/// idempotent. `.wait(true)` for consistency - see `ensure_payload_indexes`'s
+/// doc comment for the unreproduced index-creation report and the confirmed,
+/// fixed sibling bug (snapshot *restore* failing on Windows with Qdrant
+/// 1.18.1). This function's own indexes were exercised live as part of that
+/// re-investigation (facts added, then `backup` checked for a real
+/// `_kg_facts.snapshot`, not the raw-directory fallback) on both 1.18.1 and
+/// 1.19.2 and produced a real snapshot every time.
 async fn ensure_facts_indexes(client: &Qdrant) {
     let fields: &[(&str, FieldType)] = &[
         ("subject", FieldType::Text),
@@ -827,11 +854,9 @@ async fn ensure_facts_indexes(client: &Qdrant) {
     for (field, ty) in fields {
         tracing::debug!(field, "ensure_facts_index: start");
         match client
-            .create_field_index(CreateFieldIndexCollectionBuilder::new(
-                FACTS_COLLECTION,
-                *field,
-                *ty,
-            ))
+            .create_field_index(
+                CreateFieldIndexCollectionBuilder::new(FACTS_COLLECTION, *field, *ty).wait(true),
+            )
             .await
         {
             Ok(_) => tracing::debug!(field, "ensure_facts_index: ok"),
@@ -1245,11 +1270,21 @@ pub async fn live_memory_exists(config: &MindConfig, library: &str, content: &st
     }
 }
 
-/// Edit a memory core's content (the viewer's edit mode). Because point IDs are
-/// content-addressed (`deterministic_id`), changing the text changes the ID — so
-/// an edit is "delete the old point, write the new content" while CARRYING OVER
-/// the library/author so the core keeps its place and attribution. Returns the
-/// new id. Errors if the id is not an existing memory.
+/// Edit a memory core's content (the viewer's edit mode, and HTTP
+/// `/memory/edit`). Because point IDs are content-addressed
+/// (`deterministic_id`), changing the text changes the ID — so an edit is
+/// "delete the old point, write the new content" while CARRYING OVER the
+/// library/author so the core keeps its place and attribution. Returns the new
+/// id of the FIRST stored fragment. Errors if the id is not an existing
+/// memory, or if the new content is empty after the same trim/length filter
+/// `add_memory_authored` applies (nothing would be written).
+///
+/// `new_content` over `CHUNK_CHARS` is re-chunked into several points on
+/// write, same as a fresh `add`; only the first fragment's id is returned, so
+/// editing a short memory into a long one grows it into several points the
+/// caller is not individually told about (symmetric with a plain `add` of the
+/// same long text — there is no existing "the edit must stay one point"
+/// contract to preserve).
 pub async fn edit_memory(config: &MindConfig, id: &str, new_content: &str) -> Result<String> {
     let detail = memory_detail(config, id)
         .await?
@@ -1259,10 +1294,21 @@ pub async fn edit_memory(config: &MindConfig, id: &str, new_content: &str) -> Re
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("memory {id} has no library"))?;
     let author = detail.get("author").cloned();
+    // The new id must be the first STORED fragment's id, not a hash of the raw
+    // input: content over CHUNK_CHARS splits on write, and the untrimmed/
+    // unsplit text would then name a point that was never actually written.
+    let first_chunk = stored_chunks(new_content)
+        .0
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            anyhow::anyhow!("new content for {id} is empty after trimming; nothing would be stored")
+        })?;
+    let new_id = deterministic_id(&library, &first_chunk);
     // Write the new content (carries author), then delete the old point.
     add_memory_authored(config, &library, new_content, None, author.as_deref()).await?;
     delete_memory(config, &library, id).await?;
-    Ok(deterministic_id(&library, new_content.trim()))
+    Ok(new_id)
 }
 
 /// v1.6 step 1: batched payload read — one `get_points` call returns
@@ -4779,10 +4825,16 @@ async fn write_archive<W: std::io::Write>(config: &MindConfig, writer: W) -> Res
     let snapshot_tmp = tempfile::tempdir().context("creating a temp dir for Qdrant snapshots")?;
     let snapshotted = snapshot_collections_to(config, snapshot_tmp.path()).await;
     if let Err(e) = &snapshotted {
+        // `{e:#}` (not `{e}`): this is an anyhow::Error built from nested
+        // `.with_context()` calls, and the default Display shows only the
+        // outermost context ("creating a snapshot of 'x'") with the actual
+        // Qdrant-side cause dropped — exactly the undiagnosable message that
+        // hid a real Windows Qdrant 1.18.1 snapshot failure during a manual
+        // repro of this path (2026-10-12).
         eprintln!(
-            "  [warn] could not take Qdrant snapshots ({e}) - archiving qdrant/storage directly \
-             instead. That copy is only consistent if nothing was writing to it; stop Qdrant \
-             first if this store is live."
+            "  [warn] could not take Qdrant snapshots ({e:#}) - archiving qdrant/storage \
+             directly instead. That copy is only consistent if nothing was writing to it; \
+             stop Qdrant first if this store is live."
         );
     }
     if let Ok(names) = &snapshotted {

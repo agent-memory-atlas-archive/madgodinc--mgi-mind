@@ -1711,7 +1711,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
     ];
 
-    // Mark the 13 singletons as deprecated and rewrite their description with
+    // Mark the 15 singletons as deprecated and rewrite their description with
     // the v2.0 death-date and the replacement signature. Well-behaved MCP
     // clients hide tools where `deprecated: true`, but the surface still works
     // for clients that don't honor the field.

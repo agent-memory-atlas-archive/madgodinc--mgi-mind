@@ -4117,7 +4117,13 @@ pub fn is_qdrant_running() -> bool {
     is_qdrant_reachable(port)
 }
 
-const QDRANT_VERSION: &str = "1.18.1";
+// Bumped from 1.18.1 (2026-10-12): that version reproducibly fails to recover
+// a Qdrant snapshot on Windows ("failed to sync file ... os error 5" during
+// WAL replay in the recovery tmp dir), breaking `mgimind restore` on every
+// Windows store - confirmed live, A/B against v1.19.2 with the same backup
+// archive and storage path. See integrity.rs's QDRANT_LINUX_X64_1_19_2_MUSL
+// doc comment for the matching upstream changelog entries.
+const QDRANT_VERSION: &str = "1.19.2";
 
 pub async fn download_qdrant() -> Result<()> {
     let dest = qdrant_binary_path();
@@ -4129,7 +4135,11 @@ pub async fn download_qdrant() -> Result<()> {
     let is_x64 = cfg!(target_arch = "x86_64");
     let (archive_name, archive_ext, expected): (&str, &str, Option<&str>) =
         if cfg!(target_os = "windows") {
-            ("qdrant-x86_64-pc-windows-msvc", "zip", None)
+            (
+                "qdrant-x86_64-pc-windows-msvc",
+                "zip",
+                crate::integrity::pin(crate::integrity::QDRANT_WINDOWS_X64_1_19_2),
+            )
         } else if cfg!(target_os = "macos") {
             if cfg!(target_arch = "aarch64") {
                 ("qdrant-aarch64-apple-darwin", "tar.gz", None)
@@ -4143,7 +4153,7 @@ pub async fn download_qdrant() -> Result<()> {
             (
                 "qdrant-x86_64-unknown-linux-musl",
                 "tar.gz",
-                crate::integrity::pin(crate::integrity::QDRANT_LINUX_X64_1_18_1_MUSL),
+                crate::integrity::pin(crate::integrity::QDRANT_LINUX_X64_1_19_2_MUSL),
             )
         } else {
             ("qdrant-aarch64-unknown-linux-musl", "tar.gz", None)
@@ -4228,15 +4238,16 @@ fn spawn_qdrant_detached() -> Result<u32> {
         .stderr(std::process::Stdio::null());
 
     if let Ok(cfg) = crate::config::load_cached() {
-        // Listen where the client will look: `qdrant_port` is the gRPC port and
-        // HTTP sits one below it (6333/6334 by default). Without this a second
+        // Listen where the client will look: `qdrant_port` is the gRPC port,
+        // and resolved_qdrant_http_port() honours an explicit qdrant_http_port
+        // override (falling back to qdrant_port - 1). Without this a second
         // brain on the same machine (an app embedding its own) collides with the
         // first on Qdrant's built-in defaults.
         command
             .env("QDRANT__SERVICE__GRPC_PORT", cfg.qdrant_port.to_string())
             .env(
                 "QDRANT__SERVICE__HTTP_PORT",
-                cfg.qdrant_port.saturating_sub(1).to_string(),
+                cfg.resolved_qdrant_http_port().to_string(),
             );
         // Optional API-key authentication (audit #7).
         if let Some(key) = cfg.qdrant_api_key {

@@ -479,6 +479,85 @@ fn http_surface_full_contract() {
     ]);
     assert_eq!(code, 401, "/audit must reject a bad token with 401");
 
+    // 10) /memory/edit, /memory/archive, /memory/delete end to end — the by-id
+    //     surface added for mgi-assistant's "super memory" tier. The regression
+    //     this guards: editing a SHORT memory into LONG content (over
+    //     CHUNK_CHARS) re-chunks on write, same as a fresh add, so the returned
+    //     "new id" must be the id of a fragment that was actually stored, not a
+    //     hash of the raw unsplit input (storage::edit_memory used to return
+    //     exactly that: an id nothing ever wrote).
+    let post = |path: &str, body: &str| -> (u16, String) {
+        curl(&[
+            "-X",
+            "POST",
+            "-H",
+            &bearer,
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            body,
+            &format!("{base}{path}"),
+        ])
+    };
+
+    let short = "A fact worth editing into something longer.";
+    let add_body =
+        serde_json::json!({"library": lib, "content": short, "format": "json"}).to_string();
+    let (code, out) = post("/memory/add", &add_body);
+    assert_eq!(
+        code, 200,
+        "/memory/add format=json should 200, got {code}: {out}"
+    );
+    let added: serde_json::Value = serde_json::from_str(&out).expect("add response is JSON");
+    let orig_id = added["ids"][0]
+        .as_str()
+        .expect("add format=json returns ids[0]")
+        .to_string();
+
+    // Edit into long, multi-chunk content (CHUNK_CHARS is 500 in storage.rs).
+    let long = "Edited paragraph. ".repeat(60);
+    let edit_body = serde_json::json!({"id": orig_id, "content": long}).to_string();
+    let (code, out) = post("/memory/edit", &edit_body);
+    assert_eq!(code, 200, "/memory/edit should 200, got {code}: {out}");
+    let edited: serde_json::Value = serde_json::from_str(&out).expect("edit response is JSON");
+    let new_id = edited["id"].as_str().expect("edit returns id").to_string();
+
+    // The returned id must be a fragment Qdrant actually holds: search for a
+    // phrase from the edited text and find new_id among the hits.
+    let search_body =
+        serde_json::json!({"query": "Edited paragraph", "library": lib, "limit": 10}).to_string();
+    let (code, out) = post("/memory/search", &search_body);
+    assert_eq!(code, 200, "/memory/search should 200, got {code}: {out}");
+    assert!(
+        out.contains(&new_id),
+        "the id /memory/edit returned must be one Qdrant actually stored; \
+         search results: {out}, returned id: {new_id}"
+    );
+
+    // Archive it (soft-forget): gone from the default (non-archived) search...
+    let archive_body = serde_json::json!({"ids": [new_id.clone()]}).to_string();
+    let (code, out) = post("/memory/archive", &archive_body);
+    assert_eq!(code, 200, "/memory/archive should 200, got {code}: {out}");
+    assert!(
+        out.contains("\"archived\":1"),
+        "archive should report exactly one archived, got: {out}"
+    );
+    let (code, out) = post("/memory/search", &search_body);
+    assert_eq!(code, 200, "/memory/search should 200, got {code}: {out}");
+    assert!(
+        !out.contains(&new_id),
+        "an archived memory must not surface in a default search, got: {out}"
+    );
+
+    // ...then gone for good.
+    let delete_body = serde_json::json!({"ids": [new_id]}).to_string();
+    let (code, out) = post("/memory/delete", &delete_body);
+    assert_eq!(code, 200, "/memory/delete should 200, got {code}: {out}");
+    assert!(
+        out.contains("\"deleted\":1"),
+        "delete should report exactly one deleted, got: {out}"
+    );
+
     // Best-effort cleanup so repeated runs don't accumulate collections in the
     // shared Qdrant. The guard kills the server regardless.
     let _ = Command::new(bin())
@@ -622,6 +701,9 @@ fn http_v2_acl_flood_verdict_contract() {
         "/quarantine/list",
         "/quarantine/promote",
         "/memory/restore",
+        "/memory/archive",
+        "/memory/delete",
+        "/memory/edit",
         "/session/start",
         "/session/end",
         "/session/last",
