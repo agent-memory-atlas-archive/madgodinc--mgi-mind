@@ -9,6 +9,298 @@ You reach MGI-Mind through MCP tools named `mind_*` (listed at the end). There i
 also a `mgimind` CLI, but as the assistant you use the MCP tools. When this file
 says "search", it means call `mind_search` (or `mind_recall_all`).
 
+If `mgimind` is not installed yet, or the `mind_*` MCP tools are not available in
+this session, start with the next section. Once it is installed and wired in,
+the rest of this file (starting at "The one rule") is your operating manual for
+every session after that.
+
+## Installing mgi-mind
+
+This section is for an agent that has been asked to install mgi-mind for a user,
+starting from nothing but this file (or the repository URL). Work through it in
+order: decide the target, install, verify, wire it into the client, then set up
+the client's own rules file so future sessions pick up the protocol below
+without being told again (this file is not auto-loaded; nothing else here is).
+
+### 1. Decide the target
+
+- **Personal PC** (Windows, macOS, or Linux desktop): the default when the user
+  is asking on their own machine and says things like "set this up for me" or
+  "install mgi-mind".
+- **Server** (always-on Linux box, multiple agents or machines sharing one
+  brain, "VPS", "remote"): when the user says so, or you are already working
+  over SSH on a machine that is not an interactive desktop.
+- **Docker**: when the user already runs things in containers, asks for "a
+  container", or wants zero local Rust/Qdrant footprint to manage.
+
+Ask the user only if none of these fit obviously; an install writes to disk and
+downloads several hundred MB, so guessing wrong is wasteful, not catastrophic -
+prefer asking over guessing when genuinely unsure.
+
+### 2. PC install
+
+One command installs the binary and runs setup:
+
+**Linux / macOS:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/madgodinc/mgi-mind/main/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/madgodinc/mgi-mind/main/install.ps1 | iex
+```
+
+Installer flags, as environment variables before `install.sh` (verified in the
+script's own header comment):
+
+- `INSTALL_DIR` - where the binary goes (default `~/.local/bin`).
+- `MGIMIND_TAG` - a specific release tag instead of `latest`.
+- `SKIP_DOCTOR` - set non-empty to skip the model/Qdrant/ONNX download at the
+  end; run `mgimind doctor --fix` yourself later.
+- `MGIMIND_NO_PROFILE` - set non-empty to stop the installer from appending a
+  PATH line to the shell profile (macOS zsh does not include `~/.local/bin` on
+  PATH by default, so the installer does this unless told not to).
+
+`install.ps1` takes the same three as PowerShell parameters instead: `-InstallDir`
+(default `$env:LOCALAPPDATA\Programs\mgimind`), `-Tag` (default `latest`),
+`-SkipDoctor` (switch).
+
+Manual path, with no installer script: download the release archive for the OS
+from `https://github.com/madgodinc/mgi-mind/releases/latest`, put the `mgimind`
+(or `mgimind.exe`) binary on PATH, then:
+
+```bash
+mgimind init
+mgimind doctor --fix
+```
+
+Disk/network cost: `doctor --fix` downloads the embedding model
+(multilingual-e5-base, quantized ONNX, ~270 MB) and the reranker
+(bge-reranker-base, quantized ONNX, ~280 MB) into `~/mgimind/` (or `%USERPROFILE%
+\mgimind` on Windows, or wherever `MGIMIND_HOME` points), plus the Qdrant binary
+and ONNX Runtime, which land next to the `mgimind` binary itself - roughly 550 MB
+total the first time.
+
+### 3. Verify
+
+Run `mgimind doctor`. A healthy install ends with the line `All checks passed.`
+(every check printed `[OK]`, `[--]`, or `[INFO]`, never `[FAIL]`). If anything is
+`[FAIL]`, run `mgimind doctor --fix` and check again.
+
+Then a smoke test, straight from the CLI:
+
+```bash
+mgimind create smoke-test
+mgimind add smoke-test "the install smoke test works"
+mgimind search "install smoke test" --library smoke-test
+```
+
+The search should return the memory you just added. Drop the throwaway library
+once satisfied: `mgimind drop smoke-test`.
+
+### 4. Wire it into the client
+
+Use the full, absolute path to the installed binary in every config below (from
+`which mgimind` / `Get-Command mgimind`, or the install directory the installer
+printed). A bare `mgimind` depends on the client process having picked up the
+PATH change, which a freshly-installed session often has not.
+
+**Claude Code** (verified: this is the exact line both installers print at the
+end of a successful run):
+
+```bash
+claude mcp add mgimind -- /absolute/path/to/mgimind mcp
+```
+
+**Generic stdio MCP client** - every client below ultimately wants this shape;
+only the file name and the key path around `mcpServers` differ:
+
+```json
+{
+  "mcpServers": {
+    "mgimind": {
+      "command": "/absolute/path/to/mgimind",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+The following file locations are each client's own published convention, not
+something mgi-mind's code can verify from inside this repository - if one has
+moved since this was written, use the client's current docs instead:
+
+- **Claude Desktop**: `claude_desktop_config.json` (macOS:
+  `~/Library/Application Support/Claude/claude_desktop_config.json`; Windows:
+  `%APPDATA%\Claude\claude_desktop_config.json`), same `mcpServers` shape above.
+- **Cursor**: `.cursor/mcp.json` in the project (or the global `~/.cursor/mcp.json`),
+  same `mcpServers` shape.
+- **Cline**: `cline_mcp_settings.json` (inside the extension's VS Code settings
+  directory), same `mcpServers` shape.
+- **Codex CLI**: its MCP config is TOML, not JSON, typically
+  `~/.codex/config.toml` with a `[mcp_servers.mgimind]` table holding `command`
+  and `args`. Confirm the exact table name against `codex mcp add` or the
+  installed Codex CLI's own `--help` before trusting this blindly.
+- **Gemini CLI / Antigravity**: `~/.gemini/settings.json` (or the project's own
+  `.gemini/settings.json`), with an `mcpServers` object in the same shape.
+
+### 5. Load the behaviour protocol into the client's rules file
+
+AI_INSTRUCTIONS.md is not auto-loaded by any client; wiring in the MCP server
+only gives the tools, not the habit of using them. Before finishing the install,
+append (never overwrite) a short pointer to this file's protocol into whichever
+rules file the client reads every session:
+
+- Claude Code / Claude Desktop: `CLAUDE.md` (project root, or `~/.claude/CLAUDE.md`
+  for every project).
+- Cursor: `.cursorrules` or `.cursor/rules/*.mdc`.
+- Cline: `.clinerules`.
+- Codex CLI and other generic agents: `AGENTS.md`.
+- Gemini CLI: `GEMINI.md`.
+
+A short pointer is enough, for example:
+
+```
+## Persistent memory (mgi-mind)
+
+This project has mgi-mind as long-term memory (MCP tools named `mind_*`).
+Before acting on anything about this user's projects, people, environment or
+past decisions, call `mind_search` first and treat your own recollection as a
+draft to verify. See AI_INSTRUCTIONS.md in the mgi-mind repository for the full
+protocol (search triggers, writing things down, the vault, multi-agent use).
+```
+
+### 6. Server mode (Linux, systemd, remote agents)
+
+Install the same way as the PC install above (`install.sh`). The differences
+are how it is kept running and how other machines reach it, not the install
+itself.
+
+Expose the tool surface to other machines with `serve-http` (verified against
+`mgimind serve-http --help` and `src/http_api.rs`):
+
+```bash
+mgimind serve-http --host 0.0.0.0 --port 8765 \
+  --agent-token "alice:TOKEN1" \
+  --agent-token "bob:TOKEN2:project-a,project-b"
+```
+
+- `--host` defaults to `127.0.0.1` (loopback only, no remote access). Binding
+  anything else is refused unless at least one `--agent-token` is given, so an
+  accidental open brain cannot happen silently.
+- `--agent-token NAME:TOKEN[:lib1,lib2]` is repeatable. A caller's identity is
+  derived from its bearer token (not from a self-asserted header). The optional
+  `:lib1,lib2` suffix scopes that token to only those libraries (it cannot read
+  or write any other library, or reach facts/procedures/quarantine/sessions at
+  all); omit it for full access.
+- The exposed surface is a fixed allowlist, not the whole MCP tool set: memory
+  search/browse/recall/add/ingest/by-agent, fact add/query/invalidate/contested,
+  procedure learn/recall, library create/list, quarantine list/promote, memory
+  restore/archive/delete/edit, session start/end/last/context, stats, audit,
+  kv get/set, should-search. Destructive and bulk operations are not exposed.
+- `write_quota_per_min` in `config.json` (default 600) caps writes per author
+  per rolling 60 seconds, so one runaway agent cannot flood the shared store.
+  Set it to `0` to disable the cap.
+
+Keeping Qdrant running: `mgimind serve-http` brings up the bundled Qdrant itself
+on first use (the same path `mgimind mcp` uses), so no separate step is strictly
+required. For a long-lived server, supervise `serve-http` itself with your
+process manager so it (and the Qdrant child it starts) come back after a reboot
+or crash. A minimal systemd unit (not shipped in the repository; write your own
+from this skeleton, verified flags only):
+
+```ini
+[Unit]
+Description=mgi-mind HTTP tool surface
+After=network.target
+
+[Service]
+Type=simple
+Environment=MGIMIND_HOME=/var/lib/mgimind
+EnvironmentFile=/etc/mgimind/tokens.env
+ExecStart=/opt/mgimind/mgimind serve-http --host 0.0.0.0 --port 8765 --agent-token "${AGENT_TOKEN}"
+Restart=on-failure
+User=mgimind
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Put the actual token in `/etc/mgimind/tokens.env` (`AGENT_TOKEN=name:secret`),
+never directly in the unit file, which is often world-readable.
+
+Remote agents then connect one of two ways:
+
+- **MCP over SSH** (no port opened at all - the safest option when every agent
+  can already SSH into the box): point the client's MCP config at `ssh` as the
+  command, e.g. `{"command": "ssh", "args": ["user@host", "/opt/mgimind/mgimind", "mcp"]}`.
+  This is a generic SSH+stdio pattern, not special mgi-mind wiring.
+- **HTTP against `serve-http`**, with a bearer token as above, when agents
+  cannot SSH in directly.
+
+### 7. Docker
+
+The repository's own `Dockerfile` bakes the binary, bundled Qdrant, ONNX Runtime
+and both default models into one image, so running it downloads nothing further:
+
+```bash
+docker run -p 8765:8765 madgodinc/mgi-mind
+```
+
+It prints a bearer token at startup if `MGIMIND_TOKEN` is not set. Pin a stable
+token and persist memory across restarts with a volume:
+
+```bash
+docker run -p 8765:8765 -e MGIMIND_TOKEN=your-token -v mgimind-data:/data madgodinc/mgi-mind
+```
+
+Verified from `docker/entrypoint.sh`: the default entrypoint runs exactly
+`mgimind serve-http --host 0.0.0.0 --port 8765 --agent-token "user:$TOKEN"`
+internally, so everything in the server-mode section above about
+`--agent-token` and the exposed surface applies to clients connecting to this
+container too. Pass your own command (`docker run madgodinc/mgi-mind doctor`)
+to do something other than serve.
+
+### 8. Troubleshooting
+
+- **"Model not found... run doctor --fix"**: the model is missing under
+  `~/mgimind/models/`. Run `mgimind doctor --fix`.
+- **A tool (or `mind_doctor`) fails right after install**: run `mgimind doctor`
+  first; it reports exactly what is missing (Qdrant not running, a model not
+  downloaded, ONNX Runtime absent) and `--fix` downloads what it can.
+- **ONNX Runtime / Qdrant binary reported as downloaded but missing**: almost
+  always antivirus or OS quarantine eating the file right after download.
+  `mgimind doctor` prints a quarantine hint when this happens; allow the
+  `mgimind` binary and its data directory in the AV, then re-run `doctor --fix`.
+- **Windows SmartScreen** warns on the unsigned `mgimind.exe` ("Windows
+  protected your PC"): choose More info -> Run anyway.
+- **macOS Gatekeeper quarantine** on a binary downloaded through a browser
+  (not the installer, which clears it itself): `xattr -d com.apple.quarantine
+  /path/to/mgimind`.
+- **Qdrant port already in use**, or a second mgimind install on the same
+  machine: set a different `qdrant_port` (and `qdrant_http_port` if it does not
+  follow the default `qdrant_port - 1` pairing) in `config.json`, or point
+  `MGIMIND_HOME` at a separate directory for a fully independent brain.
+- **Windows: `mgimind restore` fails syncing `newest_clocks.json` (access
+  denied / os error 5)**: Qdrant below 1.19.2 cannot restore a snapshot on
+  Windows. A fresh `doctor --fix` always pulls 1.19.2 or newer (pinned in the
+  binary); this only bites an old cached Qdrant binary, so re-run
+  `doctor --fix` to replace it.
+- **Windows: Qdrant fails with "the system cannot find the specified path"
+  while creating a collection, deep inside a long `MGIMIND_HOME` path**: this is
+  Windows's ~260-character path limit, not a mgi-mind bug. Use a shorter
+  `MGIMIND_HOME` (closer to the drive root) if this happens.
+- **Dimension mismatch warning** after changing `model_name`: re-embed with
+  `mgimind migrate`.
+- **Never ask the user to paste a secret (password, API key, token) into the
+  chat so you can store it.** The vault is terminal-only by design: have the
+  user run `mgimind vault store <key> <value>` themselves in their own
+  terminal. The `mind_vault_*` MCP tools only return instructions; they never
+  read or write the secret value over the MCP or HTTP channel.
+
 ## The one rule
 
 **Assume your context is stale. Verify against memory before you act.** Before you
@@ -250,8 +542,14 @@ by-reason digest when the quarantine is non-empty; follow it with `mind_quaranti
 Libraries: `mind_library` with `action` create / list / delete. `mind_stats` for
 counts.
 
-Facts: `mind_fact` with `action` add / query / invalidate. `mind_predicate` for
-cardinality (single / temporal-single / multi).
+Facts: `mind_fact` with `action` add / query / invalidate / restore.
+`mind_predicate` for cardinality (single / temporal-single / multi).
+Invalidate is final: re-adding the exact same triple afterward refuses
+(verdict `invalidated`) instead of reviving it - use `action=restore` to
+bring it back. `action=add` takes an optional `valid_from` (when the fact
+became true in the world, as opposed to when it was recorded);
+`action=query` with `as_of` takes an optional `world_time=true` to resolve
+against `valid_from` instead of the default record-time axis.
 
 Skills: `mind_skill` with `action` match / set / list / show / remove / outcome.
 Match before the work; procedures answer after the error.

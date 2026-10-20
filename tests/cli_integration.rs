@@ -2671,3 +2671,1026 @@ fn relibrary_moves_every_chunk_of_a_long_document_and_export_still_reassembles_i
     let _ = run_cli(&mind, &ort, &["drop", &from]);
     let _ = run_cli(&mind, &ort, &["drop", &to]);
 }
+
+// ---------------------------------------------------------------------------
+// Hidden-record leaks into read paths (atlas review task 2).
+//
+// Three readers used to scroll past hidden state and surface it as if it were
+// current: `build_context`'s KG section checked only `valid` + `valid_until`
+// (missing `quarantine_candidate`/`stale`/etc.), and `storage::history` /
+// `storage::by_author` scrolled the memories collection with no visibility
+// filter at all (quarantined, archived, procedure and skill points all showed
+// up as "recent memories"). Each test below plants one hidden record and one
+// live record in the same call, so "the hidden one is absent" can't pass on a
+// query/listing that returns nothing at all.
+// ---------------------------------------------------------------------------
+
+/// `build_context`'s KG section must apply the same status-visibility rule
+/// `query_facts` does. A Single-cardinality duel deterministically dampens its
+/// loser to `status = stale` (same mechanism as
+/// `duel_rule_dampens_loser_on_single_cardinality`) - before the fix, that fact
+/// still had `valid = true` and no `valid_until`, so the old valid-only check
+/// let it through into the session briefing as if it still held.
+#[test]
+fn build_context_hides_a_dampened_fact_but_shows_the_live_one() {
+    let Some(port) = qdrant_port() else {
+        eprintln!("SKIP: set MGIMIND_IT_QDRANT=<grpc port> to run integration tests");
+        return;
+    };
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let mind = home.path().join("mgimind");
+    std::fs::create_dir_all(&mind).unwrap();
+    write_e5_config(&mind, &port);
+    // Vectorless path (facts), same as duel_rule_dampens_loser_on_single_cardinality.
+    let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| String::from("/dev/null"));
+
+    let pid = std::process::id();
+    let duel_pred = format!("ctx_test_duel_pred_{pid}");
+    let duel_subj = format!("ctx_test_duel_subj_{pid}");
+    // Unregistered predicate -> Multi cardinality -> never duels -> stays Active.
+    let live_pred = format!("ctx_test_live_pred_{pid}");
+    let live_subj = format!("ctx_test_live_subj_{pid}");
+
+    let input = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"mind_predicate","arguments":{
+                "action":"register","predicate":duel_pred,"cardinality":"Single"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"mind_fact","arguments":{
+                "action":"add","subject":duel_subj,"predicate":duel_pred,
+                "object":"ctx_dampened_loser"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"mind_fact","arguments":{
+                "action":"add","subject":duel_subj,"predicate":duel_pred,
+                "object":"ctx_live_winner"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call",
+            "params":{"name":"mind_fact","arguments":{
+                "action":"add","subject":live_subj,"predicate":live_pred,
+                "object":"ctx_live_control"}}}),
+    );
+    let (_stdout, mcp_stderr) = run_mcp(&mind, &ort, &input);
+
+    let (ok, out, err) = run_cli(&mind, &ort, &["context"]);
+    let chain =
+        format!("context out:\n{out}\n--- mcp stderr ---\n{mcp_stderr}\n--- stderr ---\n{err}");
+    assert!(ok, "mgimind context must succeed: {chain}");
+
+    // Positive controls: both the Multi-cardinality fact and the duel's winner
+    // (now Active) must appear - proves a non-empty KG section is possible at
+    // all, so "the loser is absent" below can't pass vacuously.
+    assert!(
+        out.contains(&live_subj) && out.contains("ctx_live_control"),
+        "an unrelated live fact must appear in the context briefing: {chain}"
+    );
+    assert!(
+        out.contains("ctx_live_winner"),
+        "the duel winner must appear in the context briefing: {chain}"
+    );
+    // The dampened loser (status=stale) must be hidden, exactly like query_facts.
+    assert!(
+        !out.contains("ctx_dampened_loser"),
+        "a dampened (stale) fact must NOT appear in the context briefing: {chain}"
+    );
+}
+
+/// `storage::history` used to scroll the memories collection with no
+/// visibility filter, so an archived (soft-forgotten) memory and a skill point
+/// both showed up as "recent memories". It now shares `memory_query_filter_ex`
+/// with `search_filtered`, so both are excluded the same way a normal search
+/// already excludes them.
+#[test]
+fn history_hides_an_archived_memory_and_a_skill_but_shows_the_live_one() {
+    let (Some(port), Ok(models), Ok(ort)) = (
+        qdrant_port(),
+        std::env::var("MGIMIND_IT_MODELS"),
+        std::env::var("ORT_DYLIB_PATH"),
+    ) else {
+        eprintln!("SKIP: set MGIMIND_IT_QDRANT, MGIMIND_IT_MODELS and ORT_DYLIB_PATH to run");
+        return;
+    };
+    let model_src = std::path::Path::new(&models).join("multilingual-e5-base");
+    if !model_src.join("model.onnx").exists() {
+        eprintln!("SKIP: no multilingual-e5-base model under MGIMIND_IT_MODELS");
+        return;
+    }
+
+    let (_home, mind) = setup_model_home(&port, &model_src);
+    let pid = std::process::id();
+    // Two SEPARATE libraries rather than one decay-scored library: `--decay-days
+    // 0` scores every point in the swept library as cold regardless of access
+    // (coldness_score floors at 0.0, so `0.0 >= 0` is always true) - the existing
+    // archive_then_restore test only ever checks the archived side post-sweep for
+    // exactly this reason. Archiving `lib_old` WHOLESALE and never touching
+    // `lib_live` with consolidate sidesteps that scoring edge case entirely.
+    let lib_live = format!("ithist_live_{pid}");
+    let lib_old = format!("ithist_old_{pid}");
+    let live_phrase = format!("history canary live snow leopard {pid}");
+    let archived_phrase = format!("history canary archived snow leopard {pid}");
+    let skill_name = format!("ithist-skill-{pid}");
+    let skill_marker = format!("history_skill_marker_{pid}");
+
+    run_cli(&mind, &ort, &["create", &lib_live]);
+    run_cli(&mind, &ort, &["create", &lib_old]);
+    run_cli(&mind, &ort, &["add", &lib_live, &live_phrase]);
+    run_cli(&mind, &ort, &["add", &lib_old, &archived_phrase]);
+    let (ok, _, cerr) = run_cli(
+        &mind,
+        &ort,
+        &[
+            "consolidate",
+            "--library",
+            &lib_old,
+            "--apply",
+            "--archive-cold",
+            "--decay-days",
+            "0",
+        ],
+    );
+    assert!(ok, "consolidate --archive-cold should succeed: {cerr}");
+    let (ok, _, serr) = run_cli(
+        &mind,
+        &ort,
+        &[
+            "skill",
+            "set",
+            &skill_name,
+            "--when",
+            "testing the history leak",
+            "--body",
+            &skill_marker,
+        ],
+    );
+    assert!(ok, "skill set should succeed: {serr}");
+
+    let (ok, out, herr) = run_cli(&mind, &ort, &["history", "--limit", "200"]);
+    assert!(ok, "mgimind history should succeed: {herr}");
+
+    assert!(
+        out.contains(&live_phrase),
+        "a live memory must appear in history, got:\n{out}"
+    );
+    assert!(
+        !out.contains(&archived_phrase),
+        "an archived memory must NOT appear in history, got:\n{out}"
+    );
+    assert!(
+        !out.contains(&skill_marker),
+        "a skill point must NOT appear in history, got:\n{out}"
+    );
+
+    let _ = run_cli(&mind, &ort, &["drop", &lib_live]);
+    let _ = run_cli(&mind, &ort, &["drop", &lib_old]);
+}
+
+/// `storage::by_author` excluded quarantined points but not archived ones, so
+/// "what did agent X write" could still surface a soft-forgotten memory.
+#[test]
+fn by_author_hides_an_archived_memory_but_shows_the_live_one() {
+    let (Some(port), Ok(models), Ok(ort)) = (
+        qdrant_port(),
+        std::env::var("MGIMIND_IT_MODELS"),
+        std::env::var("ORT_DYLIB_PATH"),
+    ) else {
+        eprintln!("SKIP: set MGIMIND_IT_QDRANT, MGIMIND_IT_MODELS and ORT_DYLIB_PATH to run");
+        return;
+    };
+    let model_src = std::path::Path::new(&models).join("multilingual-e5-base");
+    if !model_src.join("model.onnx").exists() {
+        eprintln!("SKIP: no multilingual-e5-base model under MGIMIND_IT_MODELS");
+        return;
+    }
+
+    let (_home, mind) = setup_model_home(&port, &model_src);
+    let pid = std::process::id();
+    // Two SEPARATE libraries, same reason as the history test above:
+    // `--decay-days 0` scores every point in the swept library as cold
+    // regardless of access, so archiving `lib_old` wholesale and never
+    // sweeping `lib_live` is what actually keeps one archived and one live.
+    let lib_live = format!("itauthor_live_{pid}");
+    let lib_old = format!("itauthor_old_{pid}");
+    let agent = format!("byauthor_tester_{pid}");
+    let live_phrase = format!("by-author canary live pangolin {pid}");
+    let archived_phrase = format!("by-author canary archived pangolin {pid}");
+
+    let input_add = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"mind_create","arguments":{"name":lib_live}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"mind_create","arguments":{"name":lib_old}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"mind_add","arguments":{
+                "library":lib_live,"content":live_phrase,"agent":agent}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call",
+            "params":{"name":"mind_add","arguments":{
+                "library":lib_old,"content":archived_phrase,"agent":agent}}}),
+    );
+    run_mcp(&mind, &ort, &input_add);
+
+    let (ok, _, cerr) = run_cli(
+        &mind,
+        &ort,
+        &[
+            "consolidate",
+            "--library",
+            &lib_old,
+            "--apply",
+            "--archive-cold",
+            "--decay-days",
+            "0",
+        ],
+    );
+    assert!(ok, "consolidate --archive-cold should succeed: {cerr}");
+
+    let by_agent_input = format!(
+        "{}\n{}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"mind_by_agent","arguments":{"agent":agent,"limit":200}}}),
+    );
+    let (stdout, stderr) = run_mcp(&mind, &ort, &by_agent_input);
+    let results = parse_mcp_results(&stdout);
+    let got = results.get(&2).cloned().unwrap_or((true, String::new()));
+    let chain = format!("by_agent: {got:?}\n--- stderr ---\n{stderr}");
+
+    assert!(!got.0, "mind_by_agent must succeed: {chain}");
+    assert!(
+        got.1.contains(&live_phrase),
+        "a live memory by this agent must appear: {chain}"
+    );
+    assert!(
+        !got.1.contains(&archived_phrase),
+        "an archived memory by this agent must NOT appear: {chain}"
+    );
+
+    let _ = run_cli(&mind, &ort, &["drop", &lib_live]);
+    let _ = run_cli(&mind, &ort, &["drop", &lib_old]);
+}
+
+// ---------------------------------------------------------------------------
+// Audit log gaps (atlas review task 4). Four AuditOp variants were declared in
+// src/audit.rs but had no producer at all (FactAdd, ProcedureAdd,
+// ProcedureOutcome, Consolidate); bulk deletes (consolidate --apply) wrote no
+// audit row at all, unlike the single-delete path; and quarantine
+// promote/expire hardcoded actor "relevance-gate" even for an explicit
+// CLI/MCP call. Each test below performs the write, reads `audit.log`
+// directly to assert the row landed with the right op/actor/content, then
+// runs `mgimind audit verify` to prove the hash chain still holds with a mix
+// of these new producers and the pre-existing ones.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fact_add_audits_the_verdict_and_the_retired_loser() {
+    let Some(port) = qdrant_port() else {
+        eprintln!("SKIP: set MGIMIND_IT_QDRANT=<grpc port> to run integration tests");
+        return;
+    };
+    let home = tempfile::tempdir().expect("tempdir");
+    let mind = home.path().join("mgimind");
+    std::fs::create_dir_all(&mind).unwrap();
+    write_e5_config(&mind, &port);
+    let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| String::from("/dev/null"));
+
+    let pid = std::process::id();
+    // A plain Multi-cardinality add via the CLI, to check the "cli" actor.
+    let (ok, _o, e) = run_cli(
+        &mind,
+        &ort,
+        &[
+            "fact",
+            "add",
+            &format!("audit_subj_{pid}"),
+            &format!("audit_pred_{pid}"),
+            "audit_obj_plain",
+        ],
+    );
+    assert!(ok, "cli fact add failed: {e}");
+
+    // A Single-cardinality duel (same deterministic mechanism as
+    // duel_rule_dampens_loser_on_single_cardinality) to exercise the flip ->
+    // retired-loser half of the audit event.
+    let duel_pred = format!("audit_duel_pred_{pid}");
+    let duel_subj = format!("audit_duel_subj_{pid}");
+    let input = format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"mind_predicate","arguments":{
+                "action":"register","predicate":duel_pred,"cardinality":"Single"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"mind_fact","arguments":{
+                "action":"add","subject":duel_subj,"predicate":duel_pred,
+                "object":"audit_loser_value","agent":"alice"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"mind_fact","arguments":{
+                "action":"add","subject":duel_subj,"predicate":duel_pred,
+                "object":"audit_winner_value","agent":"alice"}}}),
+    );
+    let (_stdout, mcp_err) = run_mcp(&mind, &ort, &input);
+
+    let log = std::fs::read_to_string(mind.join("audit.log")).unwrap_or_default();
+    let chain = format!("audit.log:\n{log}\n--- mcp stderr ---\n{mcp_err}");
+
+    assert!(
+        log.contains("\"op\":\"fact_add\"") && log.contains("\"actor\":\"cli\""),
+        "the cli fact add must be audited with op=fact_add, actor=cli: {chain}"
+    );
+    assert!(
+        log.contains("audit_obj_plain"),
+        "the plain fact's content must be in the audit log: {chain}"
+    );
+    // The flip: a line carrying the winner's content, the "won" verdict, and
+    // the retired loser's value in `before`.
+    let flip_line = log
+        .lines()
+        .find(|l| l.contains("audit_winner_value"))
+        .unwrap_or_else(|| panic!("no audit line for the duel winner: {chain}"));
+    assert!(
+        flip_line.contains("\"op\":\"fact_add\"")
+            && flip_line.contains("\"actor\":\"alice\"")
+            && flip_line.contains("\"note\":\"won\""),
+        "the duel winner's audit line must be op=fact_add, actor=alice, note=won: {flip_line}"
+    );
+    assert!(
+        flip_line.contains("audit_loser_value"),
+        "the flip's audit line must carry the retired loser's value in `before`: {flip_line}"
+    );
+
+    let (ok, vout, verr) = run_cli(&mind, &ort, &["audit", "verify"]);
+    assert!(ok, "audit verify must pass: {vout}\n{verr}");
+    assert!(
+        vout.contains("audit chain intact"),
+        "expected an intact chain, got: {vout}"
+    );
+}
+
+#[test]
+fn procedure_and_skill_writes_land_in_the_audit_log() {
+    // Unlike facts, procedures and skills are embedded (dense + sparse vectors
+    // on the core point), so this needs the real model, not the vectorless
+    // `/dev/null` ORT path the fact-add test above can use.
+    let (Some(port), Ok(models), Ok(ort)) = (
+        qdrant_port(),
+        std::env::var("MGIMIND_IT_MODELS"),
+        std::env::var("ORT_DYLIB_PATH"),
+    ) else {
+        eprintln!("SKIP: set MGIMIND_IT_QDRANT, MGIMIND_IT_MODELS and ORT_DYLIB_PATH to run");
+        return;
+    };
+    let model_src = std::path::Path::new(&models).join("multilingual-e5-base");
+    if !model_src.join("model.onnx").exists() {
+        eprintln!("SKIP: no multilingual-e5-base model under MGIMIND_IT_MODELS");
+        return;
+    }
+    let (_home, mind) = setup_model_home(&port, &model_src);
+
+    let pid = std::process::id();
+    let err_sig = format!("AUDIT_PROC_ERR_{pid}");
+    let skill_name = format!("audit-skill-{pid}");
+
+    let input = format!(
+        "{}\n{}\n{}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"mind_learn","arguments":{
+                "error":err_sig,"fix":"apply the audit-test patch"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"mind_skill","arguments":{
+                "action":"set","name":skill_name,"when":"testing audit writes",
+                "body":"do the audit-test thing"}}}),
+    );
+    let (stdout, mcp_err) = run_mcp(&mind, &ort, &input);
+    let results = parse_mcp_results(&stdout);
+    let learn_text = results.get(&2).cloned().unwrap_or_default().1;
+    let proc_id = learn_text
+        .split("id: ")
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("mind_learn must report an id: {learn_text}"));
+
+    // Outcomes, each via their own MCP call so the id from `learn` is in hand.
+    let outcome_input = format!(
+        "{}\n{}\n{}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"mind_procedure_outcome","arguments":{
+                "id":proc_id,"worked":true}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"mind_skill","arguments":{
+                "action":"outcome","name":skill_name,"worked":true}}}),
+    );
+    let (_out2, mcp_err2) = run_mcp(&mind, &ort, &outcome_input);
+
+    let log = std::fs::read_to_string(mind.join("audit.log")).unwrap_or_default();
+    let chain =
+        format!("audit.log:\n{log}\n--- stderr 1 ---\n{mcp_err}\n--- stderr 2 ---\n{mcp_err2}");
+
+    assert!(
+        log.contains("\"op\":\"procedure_add\"")
+            && log.contains("\"library\":\"_procedures\"")
+            && log.contains(&err_sig),
+        "mind_learn must be audited as procedure_add under _procedures: {chain}"
+    );
+    assert!(
+        log.contains("\"op\":\"procedure_outcome\"") && log.contains(&proc_id),
+        "mind_procedure_outcome must be audited as procedure_outcome: {chain}"
+    );
+    assert!(
+        log.contains("\"library\":\"_skills\"") && log.contains(&skill_name),
+        "mind_skill action=set must be audited under _skills: {chain}"
+    );
+    // One procedure_add (the skill) and one procedure_outcome (the skill) under
+    // _skills - both share the op with procedures, distinguished by library.
+    let skill_lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("\"library\":\"_skills\""))
+        .collect();
+    assert!(
+        skill_lines
+            .iter()
+            .any(|l| l.contains("\"op\":\"procedure_add\""))
+            && skill_lines
+                .iter()
+                .any(|l| l.contains("\"op\":\"procedure_outcome\"")),
+        "expected both a procedure_add and a procedure_outcome row under _skills: {chain}"
+    );
+
+    let (ok, vout, verr) = run_cli(&mind, &ort, &["audit", "verify"]);
+    assert!(ok, "audit verify must pass: {vout}\n{verr}");
+    assert!(vout.contains("audit chain intact"), "got: {vout}");
+}
+
+#[test]
+fn consolidate_apply_audits_the_bulk_delete_and_its_own_summary() {
+    let (Some(port), Ok(models), Ok(ort)) = (
+        qdrant_port(),
+        std::env::var("MGIMIND_IT_MODELS"),
+        std::env::var("ORT_DYLIB_PATH"),
+    ) else {
+        eprintln!("SKIP: set MGIMIND_IT_QDRANT, MGIMIND_IT_MODELS and ORT_DYLIB_PATH to run");
+        return;
+    };
+    let model_src = std::path::Path::new(&models).join("multilingual-e5-base");
+    if !model_src.join("model.onnx").exists() {
+        eprintln!("SKIP: no multilingual-e5-base model under MGIMIND_IT_MODELS");
+        return;
+    }
+    let (_home, mind) = setup_model_home(&port, &model_src);
+    let pid = std::process::id();
+    let lib = format!("itauditcons_{pid}");
+    let content = format!("audit consolidate cold-prune canary {pid}");
+
+    run_cli(&mind, &ort, &["create", &lib]);
+    // Never searched (access count stays 0), so `--decay-days 0` puts it in the
+    // conservative binary cold-prune subset deterministically - unlike exact-dup
+    // (same content in one library is the SAME content-addressed id, so two
+    // `add`s of identical text can never produce two points to merge) or
+    // near-dup (needs an embedding-cosine threshold, not guaranteed in a test).
+    run_cli(&mind, &ort, &["add", &lib, &content]);
+
+    let (ok, _cout, cerr) = run_cli(
+        &mind,
+        &ort,
+        &[
+            "consolidate",
+            "--library",
+            &lib,
+            "--apply",
+            "--prune-cold",
+            "--decay-days",
+            "0",
+        ],
+    );
+    assert!(
+        ok,
+        "consolidate --apply --prune-cold should succeed: {cerr}"
+    );
+
+    let log = std::fs::read_to_string(mind.join("audit.log")).unwrap_or_default();
+    let chain = format!("audit.log:\n{log}");
+
+    assert!(
+        log.contains("\"op\":\"delete\"")
+            && log.contains("\"actor\":\"consolidate\"")
+            && log.contains(&content),
+        "the pruned cold memory must be audited as a Delete with actor=consolidate and its \
+         content snapshotted: {chain}"
+    );
+    assert!(
+        log.contains("\"op\":\"consolidate\"")
+            && log.contains("\"actor\":\"consolidate\"")
+            && log.contains("cold pruned"),
+        "the pass itself must leave one Consolidate summary row: {chain}"
+    );
+
+    let (ok, vout, verr) = run_cli(&mind, &ort, &["audit", "verify"]);
+    assert!(ok, "audit verify must pass: {vout}\n{verr}");
+    assert!(vout.contains("audit chain intact"), "got: {vout}");
+
+    let _ = run_cli(&mind, &ort, &["drop", &lib]);
+}
+
+#[test]
+fn quarantine_promote_attributes_the_real_actor_not_relevance_gate() {
+    let (Some(port), Ok(models), Ok(ort)) = (
+        qdrant_port(),
+        std::env::var("MGIMIND_IT_MODELS"),
+        std::env::var("ORT_DYLIB_PATH"),
+    ) else {
+        eprintln!("SKIP: set MGIMIND_IT_QDRANT, MGIMIND_IT_MODELS and ORT_DYLIB_PATH to run");
+        return;
+    };
+    let model_src = std::path::Path::new(&models).join("multilingual-e5-base");
+    if !model_src.join("model.onnx").exists() {
+        eprintln!("SKIP: no multilingual-e5-base model under MGIMIND_IT_MODELS");
+        return;
+    }
+    let (_home, mind) = setup_model_home(&port, &model_src);
+    let pid = std::process::id();
+    let lib = format!("itauditquar_{pid}");
+    // Deterministic quarantine trigger (too_short), no embedding-similarity
+    // threshold involved, unlike the near-dup path.
+    let explicit_content = format!("yq{pid}");
+    let auto_content = format!("yr{pid}");
+
+    run_cli(&mind, &ort, &["create", &lib]);
+    run_cli(
+        &mind,
+        &ort,
+        &["ingest", "--library", &lib, "--memory", &explicit_content],
+    );
+    run_cli(
+        &mind,
+        &ort,
+        &["ingest", "--library", &lib, "--memory", &auto_content],
+    );
+
+    let (ok, qlist, qerr) = run_cli(&mind, &ort, &["quarantine", "list", "--library", &lib]);
+    assert!(ok, "quarantine list failed: {qerr}");
+    let id_for = |content: &str| -> String {
+        qlist
+            .split("\n\n")
+            .find(|block| block.contains(content))
+            .and_then(|block| block.split("id: ").nth(1))
+            .and_then(|s| s.split_whitespace().next())
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("no quarantine entry for '{content}', got:\n{qlist}"))
+    };
+    let explicit_id = id_for(&explicit_content);
+    let auto_id = id_for(&auto_content);
+
+    // Explicit: a human/agent calling `quarantine promote` from a terminal.
+    let (ok, _po, pe) = run_cli(&mind, &ort, &["quarantine", "promote", &explicit_id]);
+    assert!(ok, "explicit promote failed: {pe}");
+
+    // Automatic: re-submitting the SAME content via ingest is the re-assertion
+    // signal that promotes it without anyone calling `quarantine promote`.
+    let (ok, _io, ierr) = run_cli(
+        &mind,
+        &ort,
+        &["ingest", "--library", &lib, "--memory", &auto_content],
+    );
+    assert!(ok, "re-ingest (auto-promote) failed: {ierr}");
+
+    let log = std::fs::read_to_string(mind.join("audit.log")).unwrap_or_default();
+    let chain = format!("audit.log:\n{log}");
+
+    let explicit_line = log
+        .lines()
+        .find(|l| l.contains(&explicit_id) && l.contains("\"op\":\"update\""))
+        .unwrap_or_else(|| panic!("no update row for the explicit promote: {chain}"));
+    assert!(
+        explicit_line.contains("\"actor\":\"cli\""),
+        "an explicit `quarantine promote` from the CLI must be audited as actor=cli, not \
+         relevance-gate: {explicit_line}"
+    );
+
+    let auto_line = log
+        .lines()
+        .find(|l| l.contains(&auto_id) && l.contains("\"op\":\"update\""))
+        .unwrap_or_else(|| panic!("no update row for the automatic promote: {chain}"));
+    assert!(
+        auto_line.contains("\"actor\":\"relevance-gate\""),
+        "an automatic promote-by-re-ingest must stay actor=relevance-gate: {auto_line}"
+    );
+
+    let (ok, vout, verr) = run_cli(&mind, &ort, &["audit", "verify"]);
+    assert!(ok, "audit verify must pass: {vout}\n{verr}");
+    assert!(vout.contains("audit chain intact"), "got: {vout}");
+
+    let _ = run_cli(&mind, &ort, &["drop", &lib]);
+}
+
+// ---------------------------------------------------------------------------
+// Fact semantics (atlas review task 5, Mad's design decisions). Facts are
+// vectorless (audit #6), so these are gated only on Qdrant, like the duel
+// tests above - no embedding model needed.
+// ---------------------------------------------------------------------------
+
+/// Build a full MCP stdin script: initialize + notification + one
+/// `tools/call` per entry in `calls`, numbered sequentially from id 2 (so the
+/// LAST call's id is `calls.len() + 1`).
+fn mcp_call_script(calls: &[serde_json::Value]) -> String {
+    let mut lines = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string(),
+    ];
+    for (i, call) in calls.iter().enumerate() {
+        let id = i as i64 + 2;
+        lines.push(
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":call})
+                .to_string(),
+        );
+    }
+    lines.join("\n") + "\n"
+}
+
+/// §5a: re-asserting the same triple raises its own `confirmations_count`,
+/// which `entrenchment()` already had a term for but the live path never fed
+/// (the atlas review's "entrenchment is effectively age only" finding). A
+/// value confirmed 15 times must resist a single fresh contradiction
+/// (CONTESTED, not a flip); an unconfirmed young fact on a fresh axis still
+/// flips exactly as before (the positive control).
+#[test]
+fn confirmations_raise_entrenchment_against_a_single_contradiction() {
+    let Some(port) = qdrant_port() else {
+        eprintln!("SKIP: set MGIMIND_IT_QDRANT=<grpc port> to run integration tests");
+        return;
+    };
+    let home = tempfile::tempdir().expect("tempdir");
+    let mind = home.path().join("mgimind");
+    std::fs::create_dir_all(&mind).unwrap();
+    write_e5_config(&mind, &port);
+    let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| String::from("/dev/null"));
+
+    let pid = std::process::id();
+    let pred = format!("confirm_pred_{pid}");
+    let subj = format!("confirm_subj_{pid}");
+
+    let mut calls = vec![serde_json::json!({"name":"mind_predicate","arguments":{
+        "action":"register","predicate":pred,"cardinality":"Single"}})];
+    // 15 re-assertions of the SAME triple: each is a plain re-assert (no
+    // conflict, since it is the only valid fact on the axis so far), so
+    // confirmations climb 1..15 with no duel running in between.
+    for _ in 0..15 {
+        calls.push(serde_json::json!({"name":"mind_fact","arguments":{
+            "action":"add","subject":subj,"predicate":pred,"object":"confirmed_value"}}));
+    }
+    // The contradiction: a brand-new, first-mention challenger.
+    calls.push(serde_json::json!({"name":"mind_fact","arguments":{
+        "action":"add","subject":subj,"predicate":pred,"object":"challenger_value"}}));
+    let input = mcp_call_script(&calls);
+    let (stdout, stderr) = run_mcp(&mind, &ort, &input);
+    let results = parse_mcp_results(&stdout);
+    let last_id = calls.len() as i64 + 1;
+    let chain = format!("stdout parsed: {results:?}\n--- stderr ---\n{stderr}");
+    let last = results
+        .get(&last_id)
+        .cloned()
+        .unwrap_or_else(|| panic!("no result for the contradiction: {chain}"));
+    assert!(!last.0, "the contradicting add must succeed: {chain}");
+    assert!(
+        last.1.contains("contested"),
+        "a fact confirmed 15 times must end CONTESTED against a single fresh contradiction, \
+         not flip: {last:?}\n{chain}"
+    );
+
+    // Positive control: an UNCONFIRMED young fact on a fresh axis still flips
+    // exactly as before - the new behaviour only raises the bar for a
+    // CONFIRMED fact, it does not make every Single axis sticky.
+    let baseline_pred = format!("confirm_baseline_pred_{pid}");
+    let baseline_subj = format!("confirm_baseline_subj_{pid}");
+    let baseline_calls = vec![
+        serde_json::json!({"name":"mind_predicate","arguments":{
+            "action":"register","predicate":baseline_pred,"cardinality":"Single"}}),
+        serde_json::json!({"name":"mind_fact","arguments":{
+            "action":"add","subject":baseline_subj,"predicate":baseline_pred,"object":"old_value"}}),
+        serde_json::json!({"name":"mind_fact","arguments":{
+            "action":"add","subject":baseline_subj,"predicate":baseline_pred,"object":"new_value"}}),
+    ];
+    let (stdout2, stderr2) = run_mcp(&mind, &ort, &mcp_call_script(&baseline_calls));
+    let results2 = parse_mcp_results(&stdout2);
+    let flip = results2.get(&4).cloned().unwrap_or_default();
+    assert!(
+        flip.1.contains("won"),
+        "an unconfirmed young fact must still flip a single fresh contradiction, got: \
+         {flip:?}\n--- stderr ---\n{stderr2}"
+    );
+}
+
+/// §5b: explicit invalidate is final. Re-adding the same triple must refuse
+/// (verdict `invalidated`), not silently revive it; only the explicit restore
+/// path brings it back.
+#[test]
+fn explicit_invalidate_is_final_until_restored() {
+    let Some(port) = qdrant_port() else {
+        eprintln!("SKIP: set MGIMIND_IT_QDRANT=<grpc port> to run integration tests");
+        return;
+    };
+    let home = tempfile::tempdir().expect("tempdir");
+    let mind = home.path().join("mgimind");
+    std::fs::create_dir_all(&mind).unwrap();
+    write_e5_config(&mind, &port);
+    let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| String::from("/dev/null"));
+
+    let pid = std::process::id();
+    let subj = format!("inval_subj_{pid}");
+    let pred = format!("inval_pred_{pid}");
+    let obj = "inval_object";
+
+    let (ok, out, err) = run_cli(&mind, &ort, &["fact", "add", &subj, &pred, obj]);
+    assert!(ok, "fact add failed: {err}");
+    let id = out
+        .split("id: ")
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("fact add must report an id, got: {out}"));
+
+    let (ok, _o, e) = run_cli(&mind, &ort, &["fact", "invalidate", &id]);
+    assert!(ok, "fact invalidate failed: {e}");
+    let (ok, query_out, _e) = run_cli(&mind, &ort, &["fact", "query", &subj]);
+    assert!(ok);
+    assert!(
+        !query_out.contains(obj),
+        "an invalidated fact must not appear in a plain query: {query_out}"
+    );
+
+    // Re-adding the SAME triple must refuse, not revive it.
+    let (ok, readd_out, e) = run_cli(&mind, &ort, &["fact", "add", &subj, &pred, obj]);
+    assert!(ok, "fact add (re-add) should still exit 0: {e}");
+    assert!(
+        readd_out.contains("NOT added") && readd_out.contains("invalidated"),
+        "re-adding an invalidated triple must refuse, not revive it: {readd_out}"
+    );
+    let (ok, query_out2, _e) = run_cli(&mind, &ort, &["fact", "query", &subj]);
+    assert!(ok);
+    assert!(
+        !query_out2.contains(obj),
+        "it must STILL be absent after the refused re-add: {query_out2}"
+    );
+
+    // The explicit restore brings it back.
+    let (ok, restore_out, e) = run_cli(&mind, &ort, &["fact", "restore", &id]);
+    assert!(ok, "fact restore failed: {e}");
+    assert!(restore_out.contains("restored"), "got: {restore_out}");
+    let (ok, query_out3, _e) = run_cli(&mind, &ort, &["fact", "query", &subj]);
+    assert!(ok);
+    assert!(
+        query_out3.contains(obj),
+        "after an explicit restore the fact must be visible again: {query_out3}"
+    );
+}
+
+/// §5b (second half): re-adding a `stale` duel loser is a FAIR NEW DUEL, not
+/// a blank-slate revive - it keeps its original `created_at` and its own
+/// confirmation history (so a value that was briefly entrenched before losing
+/// isn't treated as a bare first mention when it comes back).
+#[test]
+fn readding_a_stale_loser_is_a_fresh_duel_that_keeps_its_created_at() {
+    let Some(port) = qdrant_port() else {
+        eprintln!("SKIP: set MGIMIND_IT_QDRANT=<grpc port> to run integration tests");
+        return;
+    };
+    let home = tempfile::tempdir().expect("tempdir");
+    let mind = home.path().join("mgimind");
+    std::fs::create_dir_all(&mind).unwrap();
+    write_e5_config(&mind, &port);
+    let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| String::from("/dev/null"));
+
+    let pid = std::process::id();
+    let pred = format!("restale_pred_{pid}");
+    let subj = format!("restale_subj_{pid}");
+
+    // Cardinality registration is MCP-only (no CLI mirror); the registry is
+    // durable in storage, so a one-shot MCP call followed by plain CLI calls
+    // in separate processes is fine.
+    let (_so, se) = run_mcp(
+        &mind,
+        &ort,
+        &mcp_call_script(&[serde_json::json!({"name":"mind_predicate","arguments":{
+            "action":"register","predicate":pred,"cardinality":"Single"}})]),
+    );
+
+    let (ok, _o, e) = run_cli(
+        &mind,
+        &ort,
+        &["fact", "add", &subj, &pred, "old_loser_value"],
+    );
+    assert!(
+        ok,
+        "first add failed: {e}\n--- predicate register stderr ---\n{se}"
+    );
+    let extract_from = |out: &str| -> String {
+        out.lines()
+            .find(|l| l.trim_start().starts_with("valid:"))
+            .and_then(|l| l.split("valid: ").nth(1))
+            .and_then(|s| s.split(" ..").next())
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("expected a 'valid: <from> ..' line, got:\n{out}"))
+    };
+    let (ok, q1, _e) = run_cli(&mind, &ort, &["fact", "query", &subj]);
+    assert!(ok);
+    let original_from = extract_from(&q1);
+
+    // A contradiction flips it to stale.
+    let (ok, _o, e) = run_cli(
+        &mind,
+        &ort,
+        &["fact", "add", &subj, &pred, "new_winner_value"],
+    );
+    assert!(ok, "flip add failed: {e}");
+    let (ok, q2, _e) = run_cli(&mind, &ort, &["fact", "query", &subj]);
+    assert!(ok);
+    assert!(
+        !q2.contains("old_loser_value"),
+        "the loser must be hidden from a plain query once stale: {q2}"
+    );
+
+    // Entrench the new winner (6 re-asserts on top of its first write) so the
+    // comparison below is unambiguous regardless of entrenchment tie-order.
+    for _ in 0..6 {
+        let (ok, _o, e) = run_cli(
+            &mind,
+            &ort,
+            &["fact", "add", &subj, &pred, "new_winner_value"],
+        );
+        assert!(ok, "re-assert of the winner failed: {e}");
+    }
+
+    // Re-propose the stale loser: a fresh duel, not a blank-slate revive. Its
+    // own carried-forward confirmations (1 -> 2) comfortably beat the winner's
+    // entrenchment at 7 confirmations.
+    let (ok, readd_out, e) = run_cli(
+        &mind,
+        &ort,
+        &["fact", "add", &subj, &pred, "old_loser_value"],
+    );
+    assert!(ok, "re-add of the stale loser failed: {e}");
+    assert!(
+        readd_out.contains("won"),
+        "the re-proposed loser must win back: {readd_out}"
+    );
+    let (ok, q3, _e) = run_cli(&mind, &ort, &["fact", "query", &subj]);
+    assert!(ok);
+    assert!(
+        q3.contains("old_loser_value"),
+        "the re-won value must be visible again: {q3}"
+    );
+    let new_from = extract_from(&q3);
+    assert_eq!(
+        original_from, new_from,
+        "created_at must be preserved across the stale -> re-won round trip, not reset"
+    );
+}
+
+/// §5c: `doubt::mark_inherited` is wired into `build_context`'s KG section -
+/// every fact it surfaces is marked inherited in THIS process. A duel
+/// challenger that is merely being re-proposed from that inherited context
+/// (not independently re-observed live) counts at the discounted weight.
+/// Compares two identical axes, one shown via `mind_context` first and one
+/// never shown: only the inherited one ends CONTESTED instead of flipping.
+///
+/// `is_inherited`/`mark_inherited` live in a per-process registry by design
+/// (a property of this session's view of a fact, not of the fact itself), so
+/// the mark and the duel it discounts must happen in the SAME `mgimind mcp`
+/// process - everything for one axis runs in one `run_mcp` call.
+#[test]
+fn inherited_fact_discounts_the_duel_challenger_weight() {
+    let Some(port) = qdrant_port() else {
+        eprintln!("SKIP: set MGIMIND_IT_QDRANT=<grpc port> to run integration tests");
+        return;
+    };
+    let home = tempfile::tempdir().expect("tempdir");
+    let mind = home.path().join("mgimind");
+    std::fs::create_dir_all(&mind).unwrap();
+    write_e5_config(&mind, &port);
+    let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| String::from("/dev/null"));
+    let pid = std::process::id();
+
+    let run_axis = |pred: &str, subj: &str, mark_via_context: bool| -> String {
+        let mut calls = vec![
+            serde_json::json!({"name":"mind_predicate","arguments":{
+                "action":"register","predicate":pred,"cardinality":"Single"}}),
+            serde_json::json!({"name":"mind_fact","arguments":{
+                "action":"add","subject":subj,"predicate":pred,"object":"value_A"}}),
+        ];
+        if mark_via_context {
+            // Surfaces value_A in the KG briefing, marking its id inherited.
+            calls.push(serde_json::json!({"name":"mind_context","arguments":{}}));
+        }
+        // value_B contradicts and wins (value_A had only 1 confirmation).
+        calls.push(serde_json::json!({"name":"mind_fact","arguments":{
+            "action":"add","subject":subj,"predicate":pred,"object":"value_B"}}));
+        // Entrench value_B (6 more re-asserts -> 7 confirmations total) so
+        // re-proposing value_A is a real contest, not a free win either way.
+        for _ in 0..6 {
+            calls.push(serde_json::json!({"name":"mind_fact","arguments":{
+                "action":"add","subject":subj,"predicate":pred,"object":"value_B"}}));
+        }
+        // The critical call: re-propose value_A, whose id is still marked
+        // inherited (nothing re-asserted it live in between).
+        calls.push(serde_json::json!({"name":"mind_fact","arguments":{
+            "action":"add","subject":subj,"predicate":pred,"object":"value_A"}}));
+        let input = mcp_call_script(&calls);
+        let (stdout, stderr) = run_mcp(&mind, &ort, &input);
+        let results = parse_mcp_results(&stdout);
+        let last_id = calls.len() as i64 + 1;
+        results
+            .get(&last_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no result for the final re-add\n--- stderr ---\n{stderr}"))
+            .1
+    };
+
+    let control_result = run_axis(
+        &format!("inh_ctrl_pred_{pid}"),
+        &format!("inh_ctrl_subj_{pid}"),
+        false,
+    );
+    assert!(
+        control_result.contains("won"),
+        "control (never shown via a briefing): re-proposing the old value against an \
+         entrenched contradictor must still flip, got: {control_result}"
+    );
+
+    let inherited_result = run_axis(&format!("inh_pred_{pid}"), &format!("inh_subj_{pid}"), true);
+    assert!(
+        inherited_result.contains("contested"),
+        "inherited (surfaced by mind_context, then re-proposed unchanged): the SAME \
+         re-proposal must be discounted enough to only contest, not flip, got: \
+         {inherited_result}"
+    );
+}
+
+/// §5d: optional world-time `valid_from` axis. `as_of` in record-time mode
+/// (default, unchanged) uses `created_at`/`valid_until` (when the store
+/// learned/retired a value); world-time mode uses `valid_from`/`valid_until`
+/// (when it became true/retired in the world) instead.
+#[test]
+fn world_time_as_of_differs_from_record_time_as_of() {
+    let Some(port) = qdrant_port() else {
+        eprintln!("SKIP: set MGIMIND_IT_QDRANT=<grpc port> to run integration tests");
+        return;
+    };
+    let home = tempfile::tempdir().expect("tempdir");
+    let mind = home.path().join("mgimind");
+    std::fs::create_dir_all(&mind).unwrap();
+    write_e5_config(&mind, &port);
+    let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| String::from("/dev/null"));
+
+    let pid = std::process::id();
+    let pred = format!("world_pred_{pid}");
+    let subj = format!("world_subj_{pid}");
+
+    let calls = vec![
+        serde_json::json!({"name":"mind_predicate","arguments":{
+            "action":"register","predicate":pred,"cardinality":"TemporalSingle"}}),
+        serde_json::json!({"name":"mind_fact","arguments":{
+            "action":"add","subject":subj,"predicate":pred,"object":"value_2020",
+            "valid_from":"2020-01-01"}}),
+        serde_json::json!({"name":"mind_fact","arguments":{
+            "action":"add","subject":subj,"predicate":pred,"object":"value_2023",
+            "valid_from":"2023-01-01"}}),
+        serde_json::json!({"name":"mind_fact","arguments":{
+            "action":"query","subject":subj,"as_of":"2020-06-01"}}),
+        serde_json::json!({"name":"mind_fact","arguments":{
+            "action":"query","subject":subj,"as_of":"2020-06-01","world_time":true}}),
+    ];
+    let input = mcp_call_script(&calls);
+    let (stdout, stderr) = run_mcp(&mind, &ort, &input);
+    let results = parse_mcp_results(&stdout);
+    let chain = format!("stdout parsed: {results:?}\n--- stderr ---\n{stderr}");
+
+    let record_time = results.get(&5).cloned().unwrap_or_default();
+    assert!(!record_time.0, "record-time query must succeed: {chain}");
+    assert!(
+        !record_time.1.contains("value_2020") && !record_time.1.contains("value_2023"),
+        "record-time as_of must find nothing at 2020-06-01 - the store only learned about \
+         this axis today: {record_time:?}\n{chain}"
+    );
+
+    let world_time = results.get(&6).cloned().unwrap_or_default();
+    assert!(!world_time.0, "world-time query must succeed: {chain}");
+    assert!(
+        world_time.1.contains("value_2020"),
+        "world-time as_of must find the fact whose valid_from covers 2020-06-01: \
+         {world_time:?}\n{chain}"
+    );
+    assert!(
+        !world_time.1.contains("value_2023"),
+        "the later value (valid_from 2023) must not appear yet at 2020-06-01: \
+         {world_time:?}\n{chain}"
+    );
+}

@@ -366,10 +366,11 @@ fn library_filter(library: &str) -> Filter {
 }
 
 /// Filter for ordinary-memory queries (phase Д6 / v0.11): exclude procedures
-/// (Д6) and quarantined points (v0.11) so they never pollute a normal
-/// `mind_search`. Uses `must_not type=procedure` (NOT `must type=memory`) so
-/// the 12k legacy points that predate the `type` field are still included.
-/// Same for `quarantined`: legacy points have no flag and stay visible.
+/// (Д6), skills (phase skill-match), and quarantined points (v0.11) so they
+/// never pollute a normal `mind_search`. Uses `must_not type=procedure`
+/// (NOT `must type=memory`) so the 12k legacy points that predate the `type`
+/// field are still included. Same for `quarantined`: legacy points have no
+/// flag and stay visible.
 fn memory_query_filter(library: Option<&str>) -> Filter {
     // Existing single-library behavior, kept so the 6 non-filtered callers and
     // their tests are untouched. Delegates to the general builder.
@@ -378,13 +379,19 @@ fn memory_query_filter(library: Option<&str>) -> Filter {
 }
 
 /// Build the memory-query filter from a full `MemoryFilter`. Always excludes
-/// procedures and quarantined points (the invariant `memory_query_filter`
+/// procedures, skills, and quarantined points (the invariant `memory_query_filter`
 /// guaranteed); then layers the optional metadata narrowings on top. Returns an
-/// error only when a date bound fails to parse — every other field is infallible.
+/// error only when a date bound fails to parse - every other field is infallible.
 fn memory_query_filter_ex(mf: &MemoryFilter) -> Result<Filter> {
     let mut f = Filter {
         must_not: vec![
             Condition::matches("type", TYPE_PROCEDURE.to_string()),
+            // Skills are addressed through their own `skill_filter()` (match /
+            // list / get all `must type=skill`); a plain `mind_search` or
+            // `mind_history` has no business surfacing a skill body as if it
+            // were a memory, so the base filter excludes it the same way it
+            // excludes procedures.
+            Condition::matches("type", TYPE_SKILL.to_string()),
             Condition::matches("quarantined", true),
         ],
         ..Default::default()
@@ -1610,11 +1617,23 @@ pub async fn add_quarantined(
     Ok(id)
 }
 
-/// Promote a quarantined point to ordinary memory. Called when the same
-/// content is re-submitted by the user — that's the signal "user is
-/// insistent, raise confidence". Flips `quarantined=false`, clears the
-/// reason, updates `updated_at`. Idempotent.
-pub async fn promote_from_quarantine(config: &MindConfig, id: &str) -> Result<bool> {
+/// Promote a quarantined point to ordinary memory. Called either automatically
+/// (the same content re-submitted via ingest - "user is insistent, raise
+/// confidence") or explicitly (`mind_quarantine_promote` / `mgimind quarantine
+/// promote`). Flips `quarantined=false`, clears the reason, updates
+/// `updated_at`. Idempotent.
+///
+/// `actor` names who asked for this: `None` (the ingest call site) keeps the
+/// audit actor "relevance-gate", since that promotion genuinely was automatic;
+/// every explicit caller (CLI/MCP/viewer/HTTP) passes its own real identity -
+/// atlas review: this used to hardcode "relevance-gate" even for an explicit
+/// promote, so the audit log could not tell "the gate decided" from "an agent
+/// decided" apart.
+pub async fn promote_from_quarantine(
+    config: &MindConfig,
+    id: &str,
+    actor: Option<&str>,
+) -> Result<bool> {
     let client = get_client(config).await?;
     let pid: qdrant_client::qdrant::PointId = id.to_string().into();
     // Fetch the existing point so we can confirm it's actually quarantined
@@ -1651,21 +1670,32 @@ pub async fn promote_from_quarantine(config: &MindConfig, id: &str) -> Result<bo
         .context("Failed to promote from quarantine")?;
     crate::audit::record(
         crate::audit::AuditEvent::new(crate::audit::AuditOp::Update, library, id)
-            .actor("relevance-gate")
-            .note("promoted from quarantine (re-asserted)"),
+            .actor(actor.unwrap_or("relevance-gate"))
+            .note(if actor.is_some() {
+                "promoted from quarantine (explicit)"
+            } else {
+                "promoted from quarantine (re-asserted)"
+            }),
     );
     Ok(true)
 }
 
 /// Expire (delete) a quarantined entry — the explicit "yes, the gate was right
-/// to reject this" verb. Guarded: it only deletes a point that is ACTUALLY
-/// quarantined, so this surface can never remove a live memory (that stays the
-/// job of `delete_memory`). The audit entry keeps the original
-/// `quarantine_reason` and a content snapshot, so an accidental expire is
-/// recoverable from the log and the reason becomes a real negative-label
-/// signal about which gate rule fired. Returns false if the id is unknown or
-/// the point is not quarantined.
-pub async fn expire_from_quarantine(config: &MindConfig, id: &str) -> Result<bool> {
+/// to reject this" verb. Always an explicit call (unlike promote, there is no
+/// automatic expire path), so `actor` should always be `Some`; `None` falls
+/// back to "unknown" rather than "relevance-gate" - atlas review: this used to
+/// hardcode "relevance-gate" even though the gate itself never calls this.
+/// Guarded: it only deletes a point that is ACTUALLY quarantined, so this
+/// surface can never remove a live memory (that stays the job of
+/// `delete_memory`). The audit entry keeps the original `quarantine_reason`
+/// and a content snapshot, so an accidental expire is recoverable from the log
+/// and the reason becomes a real negative-label signal about which gate rule
+/// fired. Returns false if the id is unknown or the point is not quarantined.
+pub async fn expire_from_quarantine(
+    config: &MindConfig,
+    id: &str,
+    actor: Option<&str>,
+) -> Result<bool> {
     let client = get_client(config).await?;
     let pid: qdrant_client::qdrant::PointId = id.to_string().into();
     let resp = client
@@ -1690,7 +1720,7 @@ pub async fn expire_from_quarantine(config: &MindConfig, id: &str) -> Result<boo
     // the delete, so a deletion is never left unrecorded — the verb advertises
     // recoverability, so the record has to land first.
     let mut ev = crate::audit::AuditEvent::new(crate::audit::AuditOp::Delete, library, id)
-        .actor("relevance-gate")
+        .actor(actor.unwrap_or("unknown"))
         .note(format!("expired from quarantine (reason: {reason})"));
     if !content.is_empty() {
         ev = ev.before(truncate_for_audit(&content));
@@ -2452,13 +2482,55 @@ pub async fn near_neighbors_by_id(
         .collect())
 }
 
-/// Batch-delete memories by id (consolidation merge step). IDs are globally
-/// unique, so this is unambiguous across libraries. No-op on an empty list.
-pub async fn delete_memories(config: &MindConfig, ids: &[String]) -> Result<()> {
+/// Best-effort pre-delete snapshot (library, content) for a batch of ids, one
+/// `GetPoints` round trip for the whole batch rather than N - a consolidate
+/// pass can delete hundreds of ids at once. Missing/unreadable entries are
+/// simply absent from the map; the caller treats that the same as a failed
+/// single-delete snapshot (log the delete anyway, just without a `before`).
+async fn fetch_batch_snapshot(
+    client: &Qdrant,
+    ids: &[String],
+) -> HashMap<String, (String, Option<String>)> {
+    let pids: Vec<qdrant_client::qdrant::PointId> = ids.iter().map(|i| i.clone().into()).collect();
+    let Ok(resp) = client
+        .get_points(
+            qdrant_client::qdrant::GetPointsBuilder::new(MEMORIES_COLLECTION, pids)
+                .with_payload(true),
+        )
+        .await
+    else {
+        return HashMap::new();
+    };
+    resp.result
+        .into_iter()
+        .filter_map(|p| {
+            let id = p.id.as_ref().map(format_point_id)?;
+            let library = extract_string(&p.payload, "library").unwrap_or_default();
+            let content = extract_string(&p.payload, "content");
+            Some((id, (library, content)))
+        })
+        .collect()
+}
+
+/// Batch-delete memories by id (consolidation merge step, and `relibrary`'s
+/// own-id cleanup after a successful move). IDs are globally unique, so this
+/// is unambiguous across libraries. No-op on an empty list.
+///
+/// Atlas review: this bypassed the audit log entirely (unlike `delete_memory`,
+/// the single-id path, which snapshots content first) - a consolidate
+/// `--apply` run could delete hundreds of memories with zero trace. Now writes
+/// one `Delete` row per id, same shape `delete_memory` writes, so `audit show
+/// <id>` and `audit verify` behave identically whether a point was deleted one
+/// at a time or in a consolidate batch. `actor` is the caller (e.g.
+/// "consolidate", "relibrary", or an HTTP agent name).
+pub async fn delete_memories(config: &MindConfig, ids: &[String], actor: &str) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
     let client = get_client(config).await?;
+
+    let snapshots = fetch_batch_snapshot(&client, ids).await;
+
     let pids: Vec<qdrant_client::qdrant::PointId> = ids.iter().map(|i| i.clone().into()).collect();
     client
         .delete_points(
@@ -2468,6 +2540,17 @@ pub async fn delete_memories(config: &MindConfig, ids: &[String]) -> Result<()> 
         )
         .await
         .context("Failed to delete memories during consolidation")?;
+
+    for id in ids {
+        let (library, content) = snapshots.get(id).cloned().unwrap_or_default();
+        let mut ev =
+            crate::audit::AuditEvent::new(crate::audit::AuditOp::Delete, library, id.clone())
+                .actor(actor);
+        if let Some(c) = content {
+            ev = ev.before(truncate_for_audit(&c));
+        }
+        crate::audit::record(ev);
+    }
     Ok(())
 }
 
@@ -4070,7 +4153,13 @@ pub async fn list_filtered(
 }
 
 /// List memories of a single library, newest first. Returns full content
-/// (no truncation) and all payload metadata. Used by the viewer.
+/// (no truncation) and all payload metadata. Used by the viewer (`/api/memories`,
+/// `/api/graph`, `/api/node`) and the CLI batch extractor.
+///
+/// Same base visibility as `search_filtered`: no procedures, no skills, no
+/// quarantined, no archived (this used to be a bare library match, so the
+/// viewer's library/graph views and the batch extractor could surface a
+/// quarantined or archived memory as if it were live).
 pub async fn list_memories(
     config: &MindConfig,
     library: &str,
@@ -4089,10 +4178,11 @@ pub async fn list_memories(
         direction: Some(Direction::Desc as i32),
         start_from: None,
     };
+    let filter = memory_query_filter_ex(&MemoryFilter::for_library(Some(library)))?;
     let response = client
         .scroll(
             ScrollPointsBuilder::new(MEMORIES_COLLECTION)
-                .filter(library_filter(library))
+                .filter(filter)
                 .limit(limit as u32)
                 .with_payload(true)
                 .order_by(order),
@@ -4187,9 +4277,16 @@ pub async fn history(config: &MindConfig, limit: usize) -> Result<Vec<SearchResu
         start_from: None,
     };
 
+    // Same base visibility as `search_filtered`: no procedures, no skills, no
+    // quarantined, no archived. Without this, `mind_history` scrolled the raw
+    // collection and listed quarantined/archived/procedure/skill points as if
+    // they were ordinary recent memories.
+    let filter = memory_query_filter_ex(&MemoryFilter::default())?;
+
     let response = client
         .scroll(
             ScrollPointsBuilder::new(MEMORIES_COLLECTION)
+                .filter(filter)
                 .limit(limit as u32)
                 .with_payload(true)
                 .order_by(order),
@@ -4232,26 +4329,22 @@ pub async fn by_author(
     let client = get_client(config).await?;
     ensure_memories_collection(&client, config.vector_size).await?;
 
-    let mut filter = Filter {
-        must: vec![Condition::matches("author", agent.to_string())],
-        must_not: vec![Condition::matches("quarantined", true)],
+    // Same base visibility as `search_filtered` / `history`: no procedures, no
+    // skills, no quarantined, no archived (this used to exclude quarantined
+    // only, so an archived memory still showed up in "what did agent X
+    // write"). `memory_query_filter_ex` also handles the author match and the
+    // v2.4 library-allowlist confinement (one -> `must`, many -> `should`),
+    // so there is one builder for all of it instead of a second hand-rolled
+    // filter that can drift from the shared one.
+    let mf = MemoryFilter {
+        author: Some(agent.to_string()),
+        libraries: libs
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_vec())
+            .unwrap_or_default(),
         ..Default::default()
     };
-    // v2.4 confinement: a library-scoped token sees only its allowlist's
-    // libraries, even when asking "what did agent X write". Same one→`must`,
-    // many→`should` (OR) pattern as the memory filter. None/empty = unscoped.
-    if let Some(libs) = libs.filter(|l| !l.is_empty()) {
-        match libs {
-            [one] => filter.must.push(Condition::matches("library", one.clone())),
-            many => filter.must.push(
-                Filter::should(
-                    many.iter()
-                        .map(|l| Condition::matches("library", l.clone())),
-                )
-                .into(),
-            ),
-        }
-    }
+    let filter = memory_query_filter_ex(&mf)?;
     let order = OrderBy {
         key: "created_at".to_string(),
         direction: Some(Direction::Desc as i32),
@@ -5107,11 +5200,12 @@ mod tests {
 
     #[test]
     fn empty_filter_is_just_the_base_exclusions() {
-        // No metadata narrowing → only the base must_not (procedure, quarantined,
-        // archived), no must conditions. Proves the fast path keeps the old
-        // search behavior aside from also hiding archived (soft-forgotten) points.
+        // No metadata narrowing: only the base must_not (procedure, skill,
+        // quarantined, archived), no must conditions. Proves the fast path keeps
+        // the old search behavior aside from also hiding archived (soft-forgotten)
+        // and skill points.
         let f = memory_query_filter_ex(&MemoryFilter::default()).unwrap();
-        assert_eq!(f.must_not.len(), 3);
+        assert_eq!(f.must_not.len(), 4);
         assert!(f.must.is_empty());
         // And matches the single-library legacy helper for the library case.
         let one = memory_query_filter_ex(&MemoryFilter::for_library(Some("p"))).unwrap();
@@ -5190,8 +5284,8 @@ mod tests {
             ..Default::default()
         };
         let f = memory_query_filter_ex(&mf).unwrap();
-        // base exclusions stay (procedure, quarantined, archived).
-        assert_eq!(f.must_not.len(), 3);
+        // base exclusions stay (procedure, skill, quarantined, archived).
+        assert_eq!(f.must_not.len(), 4);
         // multi-library OR (1) + author (1) + source (1) + one datetime range (1)
         // = 4 must conditions (the date window is a single range condition).
         assert_eq!(f.must.len(), 4);

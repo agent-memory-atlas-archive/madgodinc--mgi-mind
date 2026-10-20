@@ -197,8 +197,12 @@ impl EntryStatus {
 
 /// `must_not` conditions excluding every default-hidden status, for the fact
 /// read path. One source of truth (`is_default_visible`) drives both the in-Rust
-/// gate and the Qdrant filter.
-fn hidden_status_must_not() -> Vec<Condition> {
+/// gate and the Qdrant filter. `pub(crate)` so every other fact reader (e.g.
+/// `cli::build_context`'s KG section) can filter the same way at the Qdrant
+/// level instead of re-deriving its own hidden-status list in Rust, which is
+/// exactly how `build_context` and `query_facts` drifted apart before (the
+/// former never excluded `quarantine_candidate`).
+pub(crate) fn hidden_status_must_not() -> Vec<Condition> {
     EntryStatus::hidden_wire_strings()
         .into_iter()
         .map(|s| Condition::matches("status", s.to_string()))
@@ -239,6 +243,13 @@ pub struct Fact {
     /// on the right while active. Reading this is what enables point-in-time
     /// (`as_of`) queries; before, the field was written but no reader saw it.
     pub valid_until: Option<String>,
+    /// §5d: optional WORLD-time this fact became true (e.g. "the role started
+    /// 2026-01-01" asserted today). `None` means unknown - the record-time
+    /// axis (`created_at`/`valid_until`, when the STORE learned/retired it) is
+    /// the only one available, exactly as before this field existed. Existing
+    /// facts have no `valid_from` and stay valid without migration; record-time
+    /// `as_of` queries and `fact_valid_at` ignore this field entirely.
+    pub valid_from: Option<String>,
     /// The lifecycle status wire string (active/superseded/stale/...). `None` for
     /// legacy facts with no status field (read as active). CRITICAL distinction:
     /// `valid_until` is set by BOTH `mark_superseded` (status=superseded — a
@@ -365,6 +376,12 @@ pub(crate) async fn lock_facts_cross_process(
     Ok(FactsCrossProcessGuard { _file: file })
 }
 
+/// Unattributed fact-add (author = "unknown" in the audit log). Both CLI
+/// `fact add` and `mind_fact(action="add")` now call `add_fact_authored`
+/// directly instead (so the audit log says "cli"/the real agent, not
+/// "unknown"); this wrapper's only remaining callers are behind the
+/// `extractor` feature, so a default build sees it as unused.
+#[allow(dead_code)]
 pub async fn add_fact(
     config: &MindConfig,
     subject: &str,
@@ -374,10 +391,14 @@ pub async fn add_fact(
     add_fact_authored(config, subject, predicate, object, None).await
 }
 
-/// Shared core for the fact-add path: runs the duel, upserts, retires the loser,
-/// and returns `(id, verdict)`. `author` records which agent asserted the fact
-/// (payload `author`); the id (subject+predicate+object) is unchanged, so author
-/// is provenance only. The public `add_fact_authored` / `add_fact_authored_verdict`
+/// Shared core for the fact-add path: refuses an explicitly-invalidated
+/// triple (§5b), runs the duel with this triple's own confirmation history
+/// and inheritance status factored in (§5a/§5c), upserts, retires the loser,
+/// and returns `(id, verdict)` - `verdict` is one of `recorded` | `won` |
+/// `contested` | `quarantined` | `invalidated`. `author` records which agent
+/// asserted the fact (payload `author`); the id (subject+predicate+object) is
+/// unchanged, so author is provenance only. `valid_from` is the optional §5d
+/// world-time bound. The public `add_fact_authored` / `add_fact_authored_verdict`
 /// wrappers select which half of the tuple they expose.
 async fn add_fact_core(
     config: &MindConfig,
@@ -385,6 +406,7 @@ async fn add_fact_core(
     predicate: &str,
     object: &str,
     author: Option<&str>,
+    valid_from: Option<&str>,
 ) -> Result<(String, &'static str)> {
     // Post-critic (PR #5): acquire per-(subject, predicate) lock so
     // concurrent add_fact on the same axis cannot race the duel.
@@ -410,11 +432,68 @@ async fn add_fact_core(
     // (s,p,o) overwrites instead of piling up duplicates.
     let id = fact_id(subject, predicate, object);
     let now = chrono::Utc::now().to_rfc3339();
+
+    // §5a/§5b: one round trip for every field THIS EXACT TRIPLE's own prior row
+    // might carry. `id` is a hash of (subject, predicate, object), so a row at
+    // this id - whatever its current status - is unambiguously a past write of
+    // this same triple, never a different one.
+    let existing_fields = storage::existing_payload_strings(
+        &client,
+        storage::FACTS_COLLECTION,
+        &id,
+        &["created_at", "valid", "confirmations_count", "valid_from"],
+    )
+    .await;
+    let existing_created_at = existing_fields[0].clone();
+    let existing_valid = existing_fields[1].clone();
+    let existing_confirmations: u32 = existing_fields[2]
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let existing_valid_from = existing_fields[3].clone();
+
+    // §5b: explicit invalidate is final. `invalidate_fact_authored` is the ONLY
+    // writer of `valid = false` (every other retirement path - dampen_loser,
+    // mark_superseded - leaves `valid` alone and only changes `status`). Before
+    // this, re-adding the exact same triple always rebuilt the payload with
+    // `valid: "true"` unconditionally, silently reviving an explicit invalidate
+    // (the atlas review's finding). Now it refuses instead: the only way back
+    // is the explicit `restore_fact_authored` (`mind_fact action=restore` /
+    // `mgimind fact restore`). Nothing is written; the invalidated row is left
+    // exactly as it was.
+    if existing_valid.as_deref() == Some("false") {
+        crate::audit::record(
+            crate::audit::AuditEvent::new(
+                crate::audit::AuditOp::FactAdd,
+                "_facts".to_string(),
+                id.clone(),
+            )
+            .actor(author.unwrap_or("unknown"))
+            .note(
+                "invalidated (refused: this triple was explicitly invalidated; restore it \
+                 with mind_fact action=restore / mgimind fact restore)",
+            ),
+        );
+        return Ok((id, "invalidated"));
+    }
+
     // Keep the original created_at on re-add; only updated_at moves.
-    let created_at =
-        storage::existing_payload_string(&client, storage::FACTS_COLLECTION, &id, "created_at")
-            .await
-            .unwrap_or_else(|| now.clone());
+    let created_at = existing_created_at.unwrap_or_else(|| now.clone());
+    // §5a: this triple's own confirmation count. A re-assertion (whatever its
+    // current status - active, stale, or superseded) raises it by one; a
+    // genuinely new triple starts at 0, so the FIRST write's own contribution
+    // below is 1 - bit-for-bit the same "first mention" weight §5a's own
+    // contract test pins. Two things read this: the challenger's own weight
+    // below (so a value re-proposed after losing a duel is judged on its real
+    // history, not as a bare first mention), and the stored payload (so when
+    // THIS fact later becomes the ENTRENCHED opponent in someone else's duel,
+    // `entrenchment()` sees real confirmation history instead of always
+    // reading zero - today's "entrenchment is effectively age only" gap).
+    let confirmations = existing_confirmations + 1;
+    // §5d: a caller-supplied `valid_from` always wins; otherwise preserve
+    // whatever this triple already carried (so a plain re-assertion doesn't
+    // silently drop a world-time bound set on an earlier write).
+    let effective_valid_from = valid_from.map(str::to_string).or(existing_valid_from);
 
     // v1.4 Phase 0 step 3+4: cardinality-aware conflict detection.
     // Phase 2 step 2.2 extends this to a full duel resolution: when a
@@ -440,15 +519,24 @@ async fn add_fact_core(
     // and Multi predicates.
     let (status, loser_to_retire) =
         if cardinality.admits_conflict() && detect_conflict(&existing, object, cardinality) {
-            // Phase 2 v0: a brand-new fact has no diversity history yet, so
-            // we treat it as a single live observation with no external
-            // signals. The duel weight comes from `from_live_session=true,
-            // diverse_confirmations=1, external_signals=0`. Phase 4
-            // calibration may revise these defaults; they are the
-            // honest "first-mention" weights.
+            // §5a: `diverse_confirmations` is this triple's own confirmation
+            // count (see above) rather than a hardcoded 1 - a first-time
+            // write still gets exactly 1 (bit-for-bit the old "first mention"
+            // weight), but a value re-asserted several times, or re-proposed
+            // after losing an earlier duel, is judged on its real history.
+            //
+            // §5c: inheritance discount. `doubt::mark_inherited` is set by
+            // `build_context`'s KG section for every fact it surfaces to the
+            // agent at session start; a challenger that is merely being
+            // re-asserted from that inherited context (not independently
+            // observed live) counts at the discounted weight
+            // (`duel::INHERITANCE_DISCOUNT`), same as `from_live_session =
+            // false` always has. Nothing marks a fact inherited unless the
+            // briefing path ran, so this is a no-op for every caller that
+            // predates §5c.
             let new_inputs = crate::duel::NewFactInputs {
-                from_live_session: true,
-                diverse_confirmations: 1,
+                from_live_session: !crate::doubt::is_inherited(&id),
+                diverse_confirmations: confirmations,
                 external_signals: 0,
                 // A brand-new fact has no typed signals yet — the v1.5
                 // Phase 7 score path activates only when mind_outcome
@@ -486,6 +574,16 @@ async fn add_fact_core(
             (EntryStatus::Active, None)
         };
 
+    // §5c: a live, independently-confirmed write - this call landed the fact
+    // as Active, whether by a plain re-assertion or by winning a duel - is
+    // exactly the "first independent live-session confirmation" `mark_inherited`'s
+    // own doc comment names as the clearing trigger. A later contradiction
+    // then judges this fact on its own merits, not still discounted from
+    // whatever briefing first surfaced it.
+    if status == EntryStatus::Active {
+        crate::doubt::clear_inherited(&id);
+    }
+
     let mut payload: HashMap<String, qdrant_client::qdrant::Value> = HashMap::new();
     payload.insert("subject".into(), subject.into());
     payload.insert("predicate".into(), predicate.into());
@@ -495,6 +593,17 @@ async fn add_fact_core(
     payload.insert("valid".into(), "true".into());
     payload.insert("type".into(), "fact".into());
     payload.insert("status".into(), status.as_str().into());
+    // §5a: this triple's own confirmation count, read back by `entrenchment()`
+    // the next time this fact is the opponent in a duel.
+    payload.insert(
+        "confirmations_count".into(),
+        confirmations.to_string().into(),
+    );
+    // §5d: optional world-time axis. Absent unless this write (or an earlier
+    // one for the same triple) set it.
+    if let Some(vf) = &effective_valid_from {
+        payload.insert("valid_from".into(), vf.clone().into());
+    }
     // Which agent asserted this fact (multi-agent writes). Absent for the
     // single-agent path; legacy facts simply lack the key.
     if let Some(a) = author {
@@ -534,8 +643,17 @@ async fn add_fact_core(
     // Single -> stale. One shared helper, also used by the consolidate batch, so
     // the mapping isn't re-derived per call site.
     // Capture whether this add unseated a prior value BEFORE the retire consumes
-    // the id, so the verdict can tell a flip ("won") from a plain record.
+    // the id, so the verdict can tell a flip ("won") from a plain record. Also
+    // capture the loser's own (subject, predicate, object) for the audit trail
+    // below, since `retire_loser` only takes the id - the triple itself would
+    // otherwise be lost to the log the moment it flips.
     let flipped = loser_to_retire.is_some();
+    let retired_loser: Option<(String, String)> = loser_to_retire.as_ref().and_then(|loser_id| {
+        existing
+            .iter()
+            .find(|f| &f.id == loser_id)
+            .map(|f| (loser_id.clone(), f.object.clone()))
+    });
     if let Some(loser_id) = loser_to_retire {
         crate::duel::retire_loser(config, cardinality, &loser_id).await?;
     }
@@ -552,6 +670,29 @@ async fn add_fact_core(
         // Stale/Superseded belong to a retired loser, not to this write.
         _ => "recorded",
     };
+
+    // Atlas review: AuditOp::FactAdd was declared but had no producer at all -
+    // every fact write was invisible to the audit log. `after` is the new
+    // triple; `note` carries the duel verdict; on a flip, `before` carries the
+    // retired loser's (subject predicate object) and id, so a reader can see
+    // both halves of the duel from one line without cross-referencing.
+    crate::audit::record({
+        let mut ev = crate::audit::AuditEvent::new(
+            crate::audit::AuditOp::FactAdd,
+            "_facts".to_string(),
+            id.clone(),
+        )
+        .actor(author.unwrap_or("unknown"))
+        .after(format!("{subject} {predicate} {object}"))
+        .note(verdict);
+        if let Some((loser_id, loser_object)) = &retired_loser {
+            ev = ev.before(format!(
+                "{subject} {predicate} {loser_object} (retired id {loser_id})"
+            ));
+        }
+        ev
+    });
+
     Ok((id, verdict))
 }
 
@@ -565,22 +706,29 @@ pub async fn add_fact_authored(
     object: &str,
     author: Option<&str>,
 ) -> Result<String> {
-    Ok(add_fact_core(config, subject, predicate, object, author)
-        .await?
-        .0)
+    Ok(
+        add_fact_core(config, subject, predicate, object, author, None)
+            .await?
+            .0,
+    )
 }
 
 /// Add a fact and return `(id, verdict)` where verdict is one of
-/// `recorded` | `won` | `contested` | `quarantined`. Same write path and lock
-/// discipline as `add_fact_authored`; the duel outcome is also returned.
+/// `recorded` | `won` | `contested` | `quarantined` | `invalidated` (§5b: the
+/// triple was explicitly invalidated and this add was refused - nothing was
+/// written). Same write path and lock discipline as `add_fact_authored`; the
+/// duel outcome is also returned. `valid_from` is the optional §5d world-time
+/// bound (RFC3339 or a bare date); `None` preserves whatever this triple
+/// already carried (or leaves it absent for a genuinely new triple).
 pub async fn add_fact_authored_verdict(
     config: &MindConfig,
     subject: &str,
     predicate: &str,
     object: &str,
     author: Option<&str>,
+    valid_from: Option<&str>,
 ) -> Result<(String, &'static str)> {
-    add_fact_core(config, subject, predicate, object, author).await
+    add_fact_core(config, subject, predicate, object, author, valid_from).await
 }
 
 /// Query facts whose subject, predicate, OR object matches the term, filtered
@@ -764,6 +912,7 @@ fn fact_from_point(point: &qdrant_client::qdrant::RetrievedPoint) -> Fact {
         object: extract_string(p, "object").unwrap_or_default(),
         created_at: extract_string(p, "created_at"),
         valid_until: extract_string(p, "valid_until"),
+        valid_from: extract_string(p, "valid_from"),
         status: extract_string(p, "status"),
         valid: true,
         origin_context_id: extract_string(p, "origin_context_id"),
@@ -780,6 +929,26 @@ fn fact_from_point(point: &qdrant_client::qdrant::RetrievedPoint) -> Fact {
 /// RFC3339 strings (lexicographic == chronological for uniform UTC).
 pub(crate) fn fact_valid_at(created_at: Option<&str>, valid_until: Option<&str>, at: &str) -> bool {
     let after_start = created_at.is_none_or(|from| from <= at);
+    let before_end = valid_until.is_none_or(|until| at < until);
+    after_start && before_end
+}
+
+/// §5d: the WORLD-time counterpart of `fact_valid_at`. The start bound prefers
+/// `valid_from` (when the fact became true in the world) over `created_at`
+/// (when the store merely learned it); falls back to `created_at` when
+/// `valid_from` is absent, so a fact nobody dated explicitly behaves exactly
+/// like the record-time query would. `valid_until` (when the store retired the
+/// fact) is unchanged - a genuine world-time END axis would need its own
+/// field, out of scope here per the task: record-time retirement is still the
+/// only "until" signal the store has. Pure, so it is unit-tested without Qdrant.
+pub(crate) fn fact_valid_at_world_time(
+    created_at: Option<&str>,
+    valid_from: Option<&str>,
+    valid_until: Option<&str>,
+    at: &str,
+) -> bool {
+    let start = valid_from.or(created_at);
+    let after_start = start.is_none_or(|from| from <= at);
     let before_end = valid_until.is_none_or(|until| at < until);
     after_start && before_end
 }
@@ -851,11 +1020,16 @@ pub async fn query_fact_history(
 /// Considers active AND superseded facts (the history is in superseded entries),
 /// but excludes `valid=false` (intentionally invalidated) — a deleted fact is
 /// not "what was true", it was a mistake retracted.
+/// §5d: `world_time = true` switches the point-in-time bound from record-time
+/// (`created_at`/`valid_until`, the default, unchanged behaviour) to world-time
+/// (`valid_from`/`valid_until`, falling back to `created_at` per fact when no
+/// `valid_from` was ever set on it).
 pub async fn query_fact_as_of(
     config: &MindConfig,
     subject: &str,
     predicate: Option<&str>,
     at: &str,
+    world_time: bool,
 ) -> Result<Vec<Fact>> {
     let client = storage::get_client(config).await?;
     if !client
@@ -905,7 +1079,17 @@ pub async fn query_fact_as_of(
         let response = client.scroll(builder).await?;
         for point in &response.result {
             let f = fact_from_point(point);
-            if fact_valid_at(f.created_at.as_deref(), f.valid_until.as_deref(), at) {
+            let ok = if world_time {
+                fact_valid_at_world_time(
+                    f.created_at.as_deref(),
+                    f.valid_from.as_deref(),
+                    f.valid_until.as_deref(),
+                    at,
+                )
+            } else {
+                fact_valid_at(f.created_at.as_deref(), f.valid_until.as_deref(), at)
+            };
+            if ok {
                 facts.push(f);
             }
         }
@@ -931,7 +1115,10 @@ pub async fn query_fact_as_of(
 /// log like every other write. `actor` is the caller identity (token-derived on
 /// HTTP, the `agent` arg on MCP, "cli" on the terminal). Returns the
 /// `valid_until` timestamp it just wrote, so callers can surface it rather
-/// than silently recording a fact nobody can see was closed off.
+/// than silently recording a fact nobody can see was closed off. §5b: this is
+/// a one-way door from `add_fact_core`'s side (re-adding the same triple
+/// refuses instead of reviving it) - `restore_fact_authored` below is the
+/// only way back.
 pub async fn invalidate_fact_authored(
     config: &MindConfig,
     id: &str,
@@ -1010,6 +1197,85 @@ pub async fn invalidate_fact_authored(
     );
 
     Ok(now)
+}
+
+/// §5b: the explicit, and only, way back from an invalidate. The opposite of
+/// `invalidate_fact_authored`: clears `valid` back to `true` and REMOVES
+/// `valid_until` entirely (via Qdrant's delete-payload-key, not an empty
+/// string - `fact_valid_at` reads an absent bound as "open", but a present
+/// empty string would still compare as a real, always-failing bound). `status`
+/// is untouched - invalidate never touched it either, so a restored fact has
+/// exactly the lifecycle state (active/stale/superseded/contested) it had
+/// before. Returns `false` when the id is unknown or was not actually
+/// invalidated, so this can't be used as a no-op "restore" on a fact that was
+/// never invalidated in the first place.
+pub async fn restore_fact_authored(
+    config: &MindConfig,
+    id: &str,
+    actor: Option<&str>,
+) -> Result<bool> {
+    // Same cross-process lock discipline as invalidate: this flips `valid`,
+    // so it must serialize against a concurrent add/invalidate on the same id.
+    let _xproc = lock_facts_cross_process(config).await?;
+    let client = storage::get_client(config).await?;
+
+    let fields = storage::existing_payload_strings(
+        &client,
+        storage::FACTS_COLLECTION,
+        id,
+        &["subject", "predicate", "object", "valid"],
+    )
+    .await;
+    let (subject, predicate, object, valid) = (&fields[0], &fields[1], &fields[2], &fields[3]);
+    if valid.as_deref() != Some("false") {
+        return Ok(false);
+    }
+
+    let point_id: qdrant_client::qdrant::PointId = id.to_string().into();
+    let mut payload: HashMap<String, qdrant_client::qdrant::Value> = HashMap::new();
+    payload.insert("valid".into(), "true".into());
+    client
+        .set_payload(
+            SetPayloadPointsBuilder::new(storage::FACTS_COLLECTION, payload)
+                .points_selector(PointsIdsList {
+                    ids: vec![point_id.clone()],
+                })
+                .wait(true),
+        )
+        .await
+        .context("Failed to restore fact")?;
+    client
+        .delete_payload(
+            qdrant_client::qdrant::DeletePayloadPointsBuilder::new(
+                storage::FACTS_COLLECTION,
+                vec!["valid_until".to_string()],
+            )
+            .points_selector(PointsIdsList {
+                ids: vec![point_id],
+            })
+            .wait(true),
+        )
+        .await
+        .context("Failed to clear valid_until on restore")?;
+
+    let triple = format!(
+        "{} {} {}",
+        subject.as_deref().unwrap_or("?"),
+        predicate.as_deref().unwrap_or("?"),
+        object.as_deref().unwrap_or("?"),
+    );
+    crate::audit::record(
+        crate::audit::AuditEvent::new(
+            crate::audit::AuditOp::Update,
+            "_facts".to_string(),
+            id.to_string(),
+        )
+        .actor(actor.unwrap_or("unknown"))
+        .after(storage::truncate_for_audit(&triple))
+        .note("restored from explicit invalidate"),
+    );
+
+    Ok(true)
 }
 
 // ===== v1.4 Phase 0 step 3: cardinality registry + conflict events =====
@@ -1569,6 +1835,48 @@ mod tests {
         // only by valid_until.
         assert!(fact_valid_at(None, Some(until), "2025-03-01T00:00:00Z"));
         assert!(!fact_valid_at(None, Some(until), until));
+    }
+
+    /// §5d: `fact_valid_at_world_time` prefers `valid_from` over `created_at`
+    /// as the start bound, and falls back to `created_at` when `valid_from`
+    /// is absent - so existing data (no `valid_from` at all) behaves exactly
+    /// like `fact_valid_at` without any migration.
+    #[test]
+    fn fact_valid_at_world_time_prefers_valid_from_over_created_at() {
+        let recorded = "2026-01-01T00:00:00Z"; // when the store learned it
+        let world = "2020-01-01T00:00:00Z"; // when it became true in the world
+        // World-time: valid from 2020, long before the store ever heard of it.
+        assert!(fact_valid_at_world_time(
+            Some(recorded),
+            Some(world),
+            None,
+            "2021-01-01T00:00:00Z"
+        ));
+        // Record-time would have said this instant predates the fact entirely.
+        assert!(!fact_valid_at(Some(recorded), None, "2021-01-01T00:00:00Z"));
+
+        // No valid_from at all -> falls back to created_at, same as record-time.
+        assert!(fact_valid_at_world_time(
+            Some(recorded),
+            None,
+            None,
+            "2026-06-01T00:00:00Z"
+        ));
+        assert!(!fact_valid_at_world_time(
+            Some(recorded),
+            None,
+            None,
+            "2021-01-01T00:00:00Z"
+        ));
+
+        // valid_until is unaffected by world-time: still the hard end bound.
+        let until = "2027-01-01T00:00:00Z";
+        assert!(!fact_valid_at_world_time(
+            Some(recorded),
+            Some(world),
+            Some(until),
+            until
+        ));
     }
 
     /// Helper: build a `valid = true` fact with a fixed subject/predicate so

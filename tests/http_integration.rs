@@ -910,6 +910,97 @@ fn http_v2_acl_flood_verdict_contract() {
         "bob json recall memories must not surface the canary, got: {out}"
     );
 
+    // 4b) Facts and procedures are GLOBAL stores (no library field at all), so a
+    // library-scoped token must get NEITHER silo from JSON recall, not merely a
+    // filtered one. Planted with carol's token (unscoped, untouched quota bucket
+    // so section 6's admin budget accounting below stays exact) rather than
+    // admin's, since admin's writes are already budgeted for the duel section.
+    let fact_pred = format!("atlas_guards_secret_{pid}");
+    let fact_obj = "nightjar-obelisk-quincunx";
+    let (code, out) = post(
+        &h_carol,
+        "/fact/add",
+        &format!(
+            "{{\"subject\":\"atlas_vault_{pid}\",\"predicate\":\"{fact_pred}\",\"object\":\"{fact_obj}\"}}"
+        ),
+    );
+    assert_eq!(code, 200, "carol plant fact should 200, got {code}: {out}");
+
+    let proc_context = format!("atlas procedure canary context {pid} flaky build debugging");
+    let proc_fix = "apply the heron-lattice-paragon patch";
+    let (code, out) = post(
+        &h_carol,
+        "/procedure/learn",
+        &format!(
+            "{{\"error\":\"ATLAS_ERR_{pid}\",\"fix\":\"{proc_fix}\",\"context\":\"{proc_context}\"}}"
+        ),
+    );
+    assert_eq!(
+        code, 200,
+        "carol plant procedure should 200, got {code}: {out}"
+    );
+
+    // Positive control: an UNSCOPED token's JSON recall sees both (facts match on
+    // the predicate token; procedures match densely on the context phrase), so
+    // "absent for bob" below can't pass on a query that matches nothing at all.
+    let (code, out) = post(
+        &h_admin,
+        "/memory/recall",
+        &format!("{{\"query\":\"{fact_pred}\"}}"),
+    );
+    assert_eq!(
+        code, 200,
+        "admin json recall (fact) should 200, got {code}: {out}"
+    );
+    assert!(
+        out.contains(fact_obj),
+        "admin (unscoped) json recall must still surface the global fact, got: {out}"
+    );
+    let (code, out) = post(
+        &h_admin,
+        "/memory/recall",
+        &format!("{{\"query\":\"{proc_context}\"}}"),
+    );
+    assert_eq!(
+        code, 200,
+        "admin json recall (procedure) should 200, got {code}: {out}"
+    );
+    assert!(
+        out.contains(proc_fix),
+        "admin (unscoped) json recall must still surface the global procedure, got: {out}"
+    );
+
+    // bob (scoped to lib_a) must see neither: facts/procedures array/string empty,
+    // never a leaked fact object or procedure fix past the allowlist.
+    let (code, out) = post(
+        &h_bob,
+        "/memory/recall",
+        &format!("{{\"query\":\"{fact_pred}\"}}"),
+    );
+    assert_eq!(
+        code, 200,
+        "bob json recall (fact) should 200, got {code}: {out}"
+    );
+    assert!(
+        !out.contains(fact_obj) && out.contains("\"facts\":[]"),
+        "scoped token must get an EMPTY facts array from json recall, not the global \
+         fact store, got: {out}"
+    );
+    let (code, out) = post(
+        &h_bob,
+        "/memory/recall",
+        &format!("{{\"query\":\"{proc_context}\"}}"),
+    );
+    assert_eq!(
+        code, 200,
+        "bob json recall (procedure) should 200, got {code}: {out}"
+    );
+    assert!(
+        !out.contains(proc_fix) && out.contains("\"procedures_text\":\"\""),
+        "scoped token must get an EMPTY procedures_text from json recall, not the \
+         global procedure store, got: {out}"
+    );
+
     // 5) Flood control: the `flood` token's own bucket (quota=5). 5 writes 200,
     //    the 6th 429. bob's writes are a different bucket, so they don't interfere.
     for n in 1..=5 {

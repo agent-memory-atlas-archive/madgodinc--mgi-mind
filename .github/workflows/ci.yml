@@ -94,6 +94,12 @@ jobs:
           # the log are, and why a near-dup quarantine row can vanish before the
           # assertion reads it.
           cargo test --test cli_integration -- --nocapture --test-threads=1
+          # http_integration spawns `mgimind serve-http` over curl (preinstalled on
+          # this runner) and exercises the v2.0 library-ACL gate, including the
+          # scope canary that proves a library-scoped token's JSON recall can't see
+          # another library's facts/procedures. Was never wired into CI before,
+          # so it only ran on whatever machine a contributor had Qdrant on.
+          cargo test --test http_integration -- --nocapture --test-threads=1
 
   integration-windows:
     name: integration (windows, bundled Qdrant)
@@ -140,6 +146,8 @@ jobs:
           $env:MGIMIND_IT_MODELS = "$HOME/mgimind/models"
           # Serialized for the same collection-name collision as the Linux job.
           cargo test --test cli_integration -- --nocapture --test-threads=1
+          # Same ACL scope canary as the Linux job (curl ships on windows-latest).
+          cargo test --test http_integration -- --nocapture --test-threads=1
 
   audit:
     name: cargo-audit (vulnerabilities)

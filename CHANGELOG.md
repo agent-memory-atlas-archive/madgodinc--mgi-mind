@@ -1,5 +1,192 @@
 # Changelog
 
+## 2.8.0 (unreleased)
+
+Answers an external code review (neoneye/agent-memory-atlas) of commit
+190d1db, checked against current `main`.
+
+### Security
+
+- **A library-scoped HTTP token could read every library's facts and
+  procedures through `/memory/recall?format=json`.** `scope_gate` already
+  fail-closes a scoped token out of `/fact/query` and `/procedure/recall`
+  (both span all libraries), but `/memory/recall`'s JSON reply called
+  `query_facts` and `procedure::recall` directly with no library predicate:
+  `Fact` and `ProcedureHit` carry no library field at all, so neither store
+  could be confined to an allowlist. A token scoped to one library got the
+  other silos' global facts and procedures too. Fixed: a scoped token's JSON
+  recall now returns an empty `facts` array and an empty `procedures_text`
+  (never a missing field); only `memories` is returned, filtered through the
+  same `libraries` allowlist `/memory/search` already honours. Unscoped/admin
+  tokens are unchanged. Audited every other scoped-reachable route
+  (`/memory/{search,browse,add,ingest,by-agent}`, `/should-search`) for the
+  same pattern: `by-agent` and `ingest` already confine via server-set
+  `_scope_libs`/`_confine_extraction` (v2.4); `should-search` only echoes back
+  a library name the caller's own query text already named, so it discloses
+  nothing new.
+- **Hidden-status facts and hidden memory types could leak into three read
+  paths.** `build_context`'s KG section (the `mind_context` session-start
+  briefing) checked only `valid` + `valid_until`, not `status`, so a fact
+  dampened by a lost duel or sitting as `quarantine_candidate` (still
+  `valid = true`, no `valid_until`) showed up in the briefing as if it still
+  held. Fixed by filtering the Qdrant scroll itself with the same derived
+  `must_not` set `query_facts` uses (`knowledge::hidden_status_must_not`, now
+  `pub(crate)`), so the two read paths cannot drift apart again; the
+  `valid_until` check stays for the point-in-time half `status` does not
+  cover. Separately, `storage::history` scrolled the memories collection with
+  no visibility filter at all, so `mind_history` listed quarantined,
+  archived, procedure and skill points as recent memories, and
+  `storage::by_author` excluded quarantined points but not archived ones.
+  Both now share `memory_query_filter_ex` with `search_filtered` instead of
+  hand-rolling their own filter; that shared filter also gained a
+  `type != skill` exclusion it was missing, which also fixes
+  `search_filtered` itself, `list_filtered` (browse), and `list_memories`
+  (the viewer's `/api/memories`, `/api/graph`, `/api/node`, and the CLI batch
+  extractor) in one place. `scroll_memory_meta` (consolidate),
+  `export_all`/`scroll_all` (backup/export) and `count_library` (stats) are
+  left intentionally unfiltered: they need to see or count everything by
+  design, not just what is currently visible.
+
+### Fixed
+
+- **Four declared `AuditOp` variants had no producer at all, and quarantine
+  promote/expire logged the wrong actor.** `FactAdd`, `ProcedureAdd`,
+  `ProcedureOutcome` and `Consolidate` existed in `src/audit.rs` but nothing
+  ever wrote one, so a fact add, a procedure learn/outcome, a skill
+  set/outcome, and a whole `consolidate --apply` pass left no trace in the
+  audit log. All four now have a producer: `knowledge::add_fact_core`
+  records the duel verdict and, on a flip, the retired loser's id and value;
+  `procedure::learn`/`outcome` and `skill::set`/`outcome` record under
+  `_procedures`/`_skills` respectively (skills reuse the same two ops,
+  distinguished by `library`, rather than inventing a parallel schema); and
+  `consolidate --apply` now writes one summary row naming every count (exact
+  dups, near-dups, cold archived, cold pruned).
+- **`consolidate --apply`'s bulk delete wrote no audit row at all.**
+  `storage::delete_memories` (used by `consolidate --apply` and `relibrary`)
+  skipped the audit log entirely, unlike the single-delete path, which
+  snapshots content first. It now writes one `Delete` row per id, same shape
+  as `delete_memory`, with a single batched pre-delete snapshot read instead
+  of one read per id.
+- **Quarantine promote/expire logged actor `"relevance-gate"` even for an
+  explicit call.** `promote_from_quarantine`/`expire_from_quarantine`
+  hardcoded that actor regardless of caller. Both now take the real caller's
+  identity (CLI -> `"cli"`, MCP -> the caller-supplied agent or `"mcp"`,
+  viewer -> `"viewer"`, HTTP -> the token-derived agent); `"relevance-gate"`
+  is reserved for the one call site that is genuinely automatic (re-ingesting
+  the same content promotes it without anyone calling promote). Two adjacent
+  gaps found while wiring this: the CLI's `fact add` and the consolidated
+  `mind_fact(action="add")` never attributed an actor at all (always
+  `"unknown"` in the audit log) - both now pass `"cli"` / the real MCP agent,
+  matching the convention `fact invalidate` already used.
+- **CI never ran the HTTP ACL scope canary.** `ci.yml` ran only
+  `--test cli_integration` against the real Qdrant service; `http_integration`
+  (which proves the scope fix above, and the whole multi-agent HTTP surface)
+  only ever ran on a contributor's own machine. Both integration jobs
+  (Linux + Windows) now also run `--test http_integration`.
+
+### Changed
+
+- **Confirmations give weight in the duel rule.** Entrenchment's
+  `confirmations` term existed but had no live producer (`dependants_count`
+  and `confirmations_count` were both only ever written by the one-time
+  `migrate-v14` backfill), so entrenchment was effectively age-only and any
+  rival younger than ~9 months could flip an established fact. Re-asserting
+  the exact same triple now raises its own `confirmations_count` on the
+  existing row (read-and-increment, not a blind payload rebuild); the same
+  number also becomes the challenger's own `diverse_confirmations` the next
+  time that triple is re-proposed, instead of the hardcoded `1` every write
+  used before. A fact confirmed several times now resists a single fresh
+  contradiction (contested, not flipped); an unconfirmed young fact still
+  flips exactly as before - `weight_new` for `ChatOnly` stays bit-for-bit
+  identical (`chat_only_mode_matches_legacy_weight_new` still passes
+  untouched). `dependants_count` stays backfill-only: a cheap live producer
+  would mean walking the dependant graph on every fact write, which is not a
+  hot-path operation; confirmations carry the live signal instead.
+- **Explicit invalidate is final.** `add_fact_core` used to rebuild the whole
+  payload with `valid: "true"` on every add, so re-adding an invalidated
+  triple silently revived it. It now reads the existing row's `valid` flag
+  first and refuses (verdict `invalidated`, recorded in the audit log, no
+  storage write) instead of reviving it. Re-adding a `stale`/`superseded`
+  duel loser (never invalidated, just lost a duel) is unaffected by this
+  guard and still gets a fair new duel against whatever is currently active,
+  keeping its own original `created_at` and confirmation history rather
+  than a blank-slate revive. See Added below for the explicit way back.
+- **The inheritance discount is wired.** `doubt::mark_inherited` existed
+  with a full design doc comment but no caller. `build_context`'s KG
+  section (the `mind_context` session-start briefing) now marks every fact
+  it surfaces as inherited for that process. `add_fact_core` reads
+  `doubt::is_inherited` for the triple being proposed: if it was surfaced
+  via that briefing and is now being proposed as a duel challenger - the
+  agent echoing back what it was told rather than independently
+  reconfirming it live - the challenge counts at `duel::INHERITANCE_DISCOUNT`
+  (half weight), same as the existing `from_live_session = false` path
+  already did for any other caller. The flag clears on the fact's own next
+  live, non-conflicting confirmation. Single-source decay
+  (`diversity_weighted_count`) still has no live caller - not part of this
+  change, flagged honestly in README rather than left as a silent gap.
+- **`CONTRIBUTING.md`/`README.md`'s audit.rs description no longer
+  overclaims.** Dropped "every state transition"/"every storage mutation":
+  pinned blocks, `kv`, vault, and sessions are still not wired into the
+  audit log.
+
+### Added
+
+- **`mind_fact action="restore"` / `mgimind fact restore <id>`.** The
+  explicit way back from an invalidate (clears `valid` and removes
+  `valid_until` via a payload-key delete, not an empty string, so
+  `fact_valid_at` reads it as open-ended again).
+- **Facts gained an optional world-time axis.** `valid_from` (when a fact
+  became true in the world, as opposed to when the store recorded it) is
+  settable on `mind_fact action="add"` / `mgimind fact add --valid-from` /
+  the `/fact/add` HTTP body, and defaults to absent. `as_of` queries
+  (`mind_fact action="query"`, `mgimind fact query --as-of --world-time`)
+  gained a `world_time` mode that resolves against `valid_from`/`valid_until`
+  instead of `created_at`/`valid_until`, falling back to record-time per
+  fact when it has no `valid_from`. Existing facts need no migration: absent
+  `valid_from` behaves exactly as before.
+- **An AI agent given only the repository URL now has an install path.**
+  `AI_INSTRUCTIONS.md` only ever documented the protocol for an
+  already-installed brain. Added a new "Installing mgi-mind" section at the
+  top (before "The one rule") covering: choosing a PC, server, or Docker
+  target; the `install.sh`/`install.ps1` flags; the manual tarball path;
+  verifying with `mgimind doctor`; wiring the MCP server into Claude Code,
+  Claude Desktop, Cursor, Cline, Codex CLI, and Gemini CLI/Antigravity, plus
+  a generic stdio JSON block; appending a protocol pointer into the client's
+  own rules file (`CLAUDE.md`/`AGENTS.md`/`.cursorrules`/`.clinerules`/
+  `GEMINI.md`), since this file is never auto-loaded; `serve-http
+  --agent-token NAME:TOKEN[:lib1,lib2]` for server mode, a systemd unit
+  skeleton, and MCP over SSH vs. HTTP for remote agents; the existing
+  Dockerfile; and the real failure modes (ONNX Runtime/Qdrant quarantined by
+  AV, SmartScreen, Gatekeeper, a port already in use, Qdrant needing
+  >= 1.19.2 to restore a snapshot on Windows, Windows path-length limits on
+  a deeply nested `MGIMIND_HOME`) plus a standing rule never to ask the user
+  to paste a secret into chat. New `llms-install.md` at the repo root (the
+  filename Cline and other agents look for) points to that section instead
+  of duplicating it.
+
+### Docs
+
+- README.md/README.ru.md/README.zh.md each gained one line in the install
+  section pointing a reader at `AI_INSTRUCTIONS.md`'s new install section.
+- README.md's "The validity model" section rewritten to match the Changed
+  entries above (confirmations, invalidate/restore, inheritance discount,
+  the second time axis) and its own fact command-reference table updated
+  (`--valid-from`, `--as-of --world-time`, the new `restore` row).
+  README.ru.md/README.zh.md's fact command-reference rows and `audit.rs`
+  project-layout line corrected to match (not a full translation of the
+  English section - these two files never had one).
+
+Tests for all of the above: one integration test per finding/decision, each
+with a positive control, in `tests/cli_integration.rs` /
+`tests/http_integration.rs` (both now CI-run targets - see Fixed). Every new
+`mgimind audit verify` assertion confirms the hash chain still holds with a
+mix of old and new producer rows. `calibration.rs`'s frozen divergence corpus
+(`divergence_set_is_frozen`) is untouched and still passes bit-for-bit: the
+Changed entries above feed different DATA into `duel::entrenchment`/
+`weight_new_for_mode` on the live path, they do not change either pure
+formula, so the frozen scenarios (which construct their inputs directly) are
+unaffected.
+
 ## 2.7.1: a cross-process audit lock, and a stale MCP library cache
 
 - **The audit chain could break under concurrent writers, and now it can't.**

@@ -73,14 +73,36 @@ pub fn summary(h: &SkillHit) -> &str {
         .unwrap_or("")
 }
 
-/// Create or update a skill.
-pub async fn set(config: &MindConfig, name: &str, when: &str, body: &str) -> Result<String> {
+/// Create or update a skill. `actor` is who wrote it (the MCP/HTTP-derived
+/// agent name), for the audit trail; `None` falls back to "unknown".
+pub async fn set(
+    config: &MindConfig,
+    name: &str,
+    when: &str,
+    body: &str,
+    actor: Option<&str>,
+) -> Result<String> {
     let name = normalize_name(name)?;
     if body.trim().is_empty() {
         anyhow::bail!("skill '{name}' needs a body: what to actually do");
     }
     let existed = storage::get_skill(config, &name).await?.is_some();
     let id = storage::add_skill(config, &name, when, body).await?;
+    // Atlas review: skills are a separate write path from procedures (own
+    // storage fn, own library), so they never produced an AuditOp::ProcedureAdd
+    // event even after procedures started wiring it up. Reused rather than a
+    // new op: same "a playbook was written" shape, distinguished by `library`
+    // ("_skills" vs "_procedures").
+    crate::audit::record(
+        crate::audit::AuditEvent::new(
+            crate::audit::AuditOp::ProcedureAdd,
+            "_skills".to_string(),
+            id.clone(),
+        )
+        .actor(actor.unwrap_or("unknown"))
+        .after(format!("skill '{name}'\nwhen: {}", when.trim()))
+        .note(if existed { "updated" } else { "added" }),
+    );
     Ok(format!(
         "{} skill '{name}' [id: {id}]\n  when: {}",
         if existed { "Updated" } else { "Added" },
@@ -176,17 +198,37 @@ pub async fn remove(config: &MindConfig, name: &str) -> Result<String> {
 /// Record how applying a skill went. `verify` promotes it to verified on
 /// success; pass it only for a deterministic signal, the same bar procedures
 /// hold, because a skill nobody checked is a preference, not a proven rule.
+/// `actor` is who recorded it, same convention as `set`.
 pub async fn outcome(
     config: &MindConfig,
     name: &str,
     worked: bool,
     verify: bool,
+    actor: Option<&str>,
 ) -> Result<String> {
     let name = normalize_name(name)?;
     let Some(h) = storage::get_skill(config, &name).await? else {
         return Ok(format!("No skill named '{name}'."));
     };
     storage::procedure_outcome(config, &h.id, worked, verify).await?;
+    // Same reuse-not-reinvent reasoning as `set`: ProcedureOutcome, scoped to
+    // "_skills" by `library`.
+    crate::audit::record(
+        crate::audit::AuditEvent::new(
+            crate::audit::AuditOp::ProcedureOutcome,
+            "_skills".to_string(),
+            h.id.clone(),
+        )
+        .actor(actor.unwrap_or("unknown"))
+        .note(format!(
+            "skill '{name}' worked={worked} verify={verify}{}",
+            if worked && verify {
+                " (now verified)"
+            } else {
+                ""
+            }
+        )),
+    );
     Ok(format!(
         "Recorded outcome for skill '{name}': {}.",
         match (worked, verify) {

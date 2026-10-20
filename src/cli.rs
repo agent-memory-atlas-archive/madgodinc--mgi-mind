@@ -791,6 +791,12 @@ pub enum FactAction {
         subject: String,
         predicate: String,
         object: String,
+        /// §5d: when this became true IN THE WORLD (RFC3339 or YYYY-MM-DD),
+        /// as opposed to when the store learned it. Omit for "unknown" - the
+        /// record-time axis stays the only one available, exactly as before
+        /// this flag existed.
+        #[arg(long)]
+        valid_from: Option<String>,
     },
     /// Query facts about a subject
     Query {
@@ -803,9 +809,21 @@ pub enum FactAction {
         /// (RFC3339 or YYYY-MM-DD), time-travelling the superseded chain.
         #[arg(long)]
         as_of: Option<String>,
+        /// With --as-of: use world-time (`valid_from`/`valid_until`) instead
+        /// of record-time (`created_at`/`valid_until`). Falls back to
+        /// record-time per fact when it has no `valid_from`.
+        #[arg(long)]
+        world_time: bool,
     },
     /// Invalidate a fact
     Invalidate {
+        /// Fact ID
+        id: String,
+    },
+    /// §5b: restore a fact explicitly invalidated by `fact invalidate`. The
+    /// only way back - re-adding the same triple refuses instead of reviving
+    /// it silently.
+    Restore {
         /// Fact ID
         id: String,
     },
@@ -1039,13 +1057,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                 subject,
                 predicate,
                 object,
-            } => cmd_fact_add(&subject, &predicate, &object).await,
+                valid_from,
+            } => cmd_fact_add(&subject, &predicate, &object, valid_from.as_deref()).await,
             FactAction::Query {
                 subject,
                 history,
                 as_of,
-            } => cmd_fact_query(&subject, history, as_of.as_deref()).await,
+                world_time,
+            } => cmd_fact_query(&subject, history, as_of.as_deref(), world_time).await,
             FactAction::Invalidate { id } => cmd_fact_invalidate(&id).await,
+            FactAction::Restore { id } => cmd_fact_restore(&id).await,
         },
         Commands::Session { action } => match action {
             SessionAction::Start { agent } => cmd_session_start(&agent).await,
@@ -1317,7 +1338,7 @@ async fn cmd_quarantine_show(id: &str) -> Result<()> {
 
 async fn cmd_quarantine_promote(id: &str) -> Result<()> {
     let config = crate::config::load_cached()?;
-    if crate::storage::promote_from_quarantine(&config, id).await? {
+    if crate::storage::promote_from_quarantine(&config, id, Some("cli")).await? {
         println!("Promoted '{id}' from quarantine to ordinary memory.");
     } else {
         println!("Nothing to promote: '{id}' is not in quarantine.");
@@ -1327,7 +1348,7 @@ async fn cmd_quarantine_promote(id: &str) -> Result<()> {
 
 async fn cmd_quarantine_expire(id: &str) -> Result<()> {
     let config = crate::config::load_cached()?;
-    if crate::storage::expire_from_quarantine(&config, id).await? {
+    if crate::storage::expire_from_quarantine(&config, id, Some("cli")).await? {
         println!(
             "Expired '{id}': confirmed the gate was right. Removed from quarantine \
              (content + reason recorded in the audit log first, when audit is enabled)."
@@ -3068,11 +3089,26 @@ pub(crate) async fn build_context(config: &crate::config::MindConfig) -> Result<
             direction: Some(qdrant_client::qdrant::Direction::Desc as i32),
             start_from: None,
         };
+        // Same visibility rule as `query_facts`: `valid = true` AND status NOT
+        // IN the hidden set derived from `EntryStatus::is_default_visible`.
+        // Filtering in the Qdrant scroll itself (not just in Rust below) means
+        // this can't drift from `query_facts` again the way it did before - a
+        // `quarantine_candidate` fact (valid=true, no valid_until) used to pass
+        // the old Rust-only check and show up in the briefing as current.
+        let visibility_filter = qdrant_client::qdrant::Filter {
+            must: vec![qdrant_client::qdrant::Condition::matches(
+                "valid",
+                "true".to_string(),
+            )],
+            must_not: crate::knowledge::hidden_status_must_not(),
+            ..Default::default()
+        };
         let scroll = client
             .scroll(
                 qdrant_client::qdrant::ScrollPointsBuilder::new(crate::storage::FACTS_COLLECTION)
                     .limit(20)
                     .with_payload(true)
+                    .filter(visibility_filter)
                     .order_by(order),
             )
             .await;
@@ -3084,19 +3120,23 @@ pub(crate) async fn build_context(config: &crate::config::MindConfig) -> Result<
                 let subj = crate::storage::extract_string_pub(p, "subject").unwrap_or_default();
                 let pred = crate::storage::extract_string_pub(p, "predicate").unwrap_or_default();
                 let obj = crate::storage::extract_string_pub(p, "object").unwrap_or_default();
-                let valid = crate::storage::extract_string_pub(p, "valid").unwrap_or_default();
                 let valid_until = crate::storage::extract_string_pub(p, "valid_until");
-                // Currently valid means BOTH signals agree it still is: the
-                // `valid` flag (flipped by an explicit invalidate) and
-                // `valid_until` (set to the retirement time by a lost duel or
-                // a superseding write - see `fact_valid_at`). Either one
-                // saying "not current" is enough to drop it from this
-                // snapshot, so stale/superseded/invalidated facts never show
-                // up here as if they still held.
-                let currently_valid = valid == "true"
-                    && crate::knowledge::fact_valid_at(None, valid_until.as_deref(), &now);
-                if currently_valid {
+                // The Qdrant filter above already confines this scroll to
+                // valid + default-visible facts; `fact_valid_at` still adds the
+                // point-in-time check (`valid_until` can be in the past even on
+                // a point the status filter let through), so a superseded-but-
+                // not-yet-relabeled fact doesn't show as current.
+                if crate::knowledge::fact_valid_at(None, valid_until.as_deref(), &now) {
                     let _ = writeln!(facts_summary, "  {subj} -> {pred} -> {obj}");
+                    // §5c: every fact this briefing surfaces is inherited
+                    // context, not a live observation - mark it so a duel
+                    // challenger that merely re-asserts it (rather than being
+                    // independently reconfirmed) counts at the discounted
+                    // weight. Cleared the moment the agent actually re-asserts
+                    // it live (see add_fact_core).
+                    if let Some(id) = point.id.as_ref().map(crate::storage::format_point_id) {
+                        crate::doubt::mark_inherited(&id);
+                    }
                 }
             }
         }
@@ -3386,10 +3426,33 @@ async fn cmd_browse(mfilter: crate::storage::MemoryFilter, limit: usize) -> Resu
     Ok(())
 }
 
-async fn cmd_fact_add(subject: &str, predicate: &str, object: &str) -> Result<()> {
+async fn cmd_fact_add(
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    valid_from: Option<&str>,
+) -> Result<()> {
     let config = crate::config::load_cached()?;
-    let id = crate::knowledge::add_fact(&config, subject, predicate, object).await?;
-    println!("Fact added: {subject} -> {predicate} -> {object} [id: {id}]");
+    // Attribute to "cli" explicitly, same convention as `run_fact_invalidate`:
+    // the bare terminal path should never land in the audit log as "unknown".
+    let (id, verdict) = crate::knowledge::add_fact_authored_verdict(
+        &config,
+        subject,
+        predicate,
+        object,
+        Some("cli"),
+        valid_from,
+    )
+    .await?;
+    if verdict == "invalidated" {
+        println!(
+            "Fact NOT added: '{subject} -> {predicate} -> {object}' [id: {id}] was explicitly \
+             invalidated. Restore it first with `mgimind fact restore {id}` if you meant to \
+             bring it back."
+        );
+    } else {
+        println!("Fact added ({verdict}): {subject} -> {predicate} -> {object} [id: {id}]");
+    }
     Ok(())
 }
 
@@ -3420,10 +3483,15 @@ pub(crate) fn render_facts(subject: &str, facts: &[crate::knowledge::Fact]) -> S
     out.trim_end().to_string()
 }
 
-async fn cmd_fact_query(subject: &str, history: bool, as_of: Option<&str>) -> Result<()> {
+async fn cmd_fact_query(
+    subject: &str,
+    history: bool,
+    as_of: Option<&str>,
+    world_time: bool,
+) -> Result<()> {
     let config = crate::config::load_cached()?;
     let facts = if let Some(at) = as_of {
-        crate::knowledge::query_fact_as_of(&config, subject, None, at).await?
+        crate::knowledge::query_fact_as_of(&config, subject, None, at, world_time).await?
     } else if history {
         crate::knowledge::query_fact_history(&config, subject, None).await?
     } else {
@@ -3435,6 +3503,17 @@ async fn cmd_fact_query(subject: &str, history: bool, as_of: Option<&str>) -> Re
 
 async fn cmd_fact_invalidate(id: &str) -> Result<()> {
     println!("{}", run_fact_invalidate(id).await?);
+    Ok(())
+}
+
+/// §5b: `mgimind fact restore <id>`.
+async fn cmd_fact_restore(id: &str) -> Result<()> {
+    let config = crate::config::load_cached()?;
+    if crate::knowledge::restore_fact_authored(&config, id, Some("cli")).await? {
+        println!("Fact '{id}' restored.");
+    } else {
+        println!("Nothing to restore: '{id}' is not currently invalidated (or is unknown).");
+    }
     Ok(())
 }
 
@@ -3578,7 +3657,7 @@ async fn cmd_skill(action: SkillAction) -> Result<()> {
                     .with_context(|| format!("reading skill body from {path}"))?,
                 (None, None) => anyhow::bail!("give the playbook with --body or --body-file"),
             };
-            crate::skill::set(&config, &name, &when, &text).await?
+            crate::skill::set(&config, &name, &when, &text, Some("cli")).await?
         }
         SkillAction::List => crate::skill::list(&config).await?,
         SkillAction::Show { name } => crate::skill::show(&config, &name).await?,
@@ -3590,7 +3669,7 @@ async fn cmd_skill(action: SkillAction) -> Result<()> {
             name,
             failed,
             verify,
-        } => crate::skill::outcome(&config, &name, !failed, verify).await?,
+        } => crate::skill::outcome(&config, &name, !failed, verify, Some("cli")).await?,
     };
     println!("{out}");
     Ok(())

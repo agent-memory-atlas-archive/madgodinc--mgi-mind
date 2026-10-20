@@ -459,7 +459,7 @@ async fn api_quarantine_promote(
 ) -> Result<Json<serde_json::Value>, Response> {
     check_auth(&state, &headers, &q).map_err(|s| s.into_response())?;
     state.allow_broad()?; // no mutations from a confined (read-only) viewer
-    let promoted = storage::promote_from_quarantine(&state.config, &id)
+    let promoted = storage::promote_from_quarantine(&state.config, &id, Some("viewer"))
         .await
         .map_err(internal)?;
     if !promoted {
