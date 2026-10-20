@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.8.1 (unreleased)
+## 2.8.1 (2026-10-20)
 
 Raises the MCP tool-definition quality (Glama TDQS): rewrote descriptions for
 the lowest-scoring tools and tightened parameter-level documentation across the
