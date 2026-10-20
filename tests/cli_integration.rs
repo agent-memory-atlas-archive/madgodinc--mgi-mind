@@ -3694,3 +3694,150 @@ fn world_time_as_of_differs_from_record_time_as_of() {
          {world_time:?}\n{chain}"
     );
 }
+
+/// Glama tool-definition-quality fix: the 15 deprecated v1.0 singleton
+/// aliases (mind_vault_store and its siblings) must be hidden from
+/// `tools/list` by default (score penalty for a bloated, half-duplicate
+/// surface) but keep dispatching exactly as before for any script that calls
+/// them directly without listing first. `MGIMIND_LIST_DEPRECATED=1` restores
+/// the full listing for a client that wants to see (and migrate off) them.
+/// mind_vault_store itself touches no storage, but the MCP server tries to
+/// auto-start Qdrant on launch regardless of which tool gets called; pointing
+/// config at the already-running test instance (same pattern as the other
+/// vectorless tests above) keeps that a no-op instead of a slow spawn attempt
+/// against a missing binary or a port collision with a real Qdrant.
+#[test]
+fn deprecated_aliases_hidden_by_default_but_still_dispatch() {
+    let Some(port) = qdrant_port() else {
+        eprintln!("SKIP: set MGIMIND_IT_QDRANT=<grpc port> to run integration tests");
+        return;
+    };
+    let home = tempfile::tempdir().expect("tempdir");
+    let mind = home.path().join("mgimind");
+    std::fs::create_dir_all(&mind).unwrap();
+    write_e5_config(&mind, &port);
+    let ort = std::env::var("ORT_DYLIB_PATH").unwrap_or_else(|_| String::from("/dev/null"));
+
+    let input = format!(
+        "{}\n{}\n{}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"mind_vault_store","arguments":{"key":"itest-hidden-alias"}}}),
+    );
+
+    use std::io::Write;
+
+    // Default: MGIMIND_LIST_DEPRECATED unset (explicitly removed in case the
+    // launching shell has it set, so this test is not at the mercy of the
+    // ambient environment).
+    let mut child = Command::new(bin())
+        .arg("mcp")
+        .env("MGIMIND_HOME", &mind)
+        .env("ORT_DYLIB_PATH", &ort)
+        .env_remove("MGIMIND_LIST_DEPRECATED")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn mgimind mcp");
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(input.as_bytes())
+        .expect("write requests");
+    let out = child.wait_with_output().expect("wait mcp");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let chain = format!("stdout: {stdout}\n--- stderr ---\n{stderr}");
+
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("non-JSON on stdout: {e}\n{l}")))
+        .collect();
+    let tools_list = responses
+        .iter()
+        .find(|v| v["id"] == 2)
+        .unwrap_or_else(|| panic!("no tools/list response: {chain}"));
+    let tools = tools_list["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools/list result has no tools array: {chain}"));
+    assert!(
+        !tools.iter().any(|t| t["name"] == "mind_vault_store"),
+        "mind_vault_store must be hidden from tools/list by default: {chain}"
+    );
+    assert_eq!(
+        tools.len(),
+        29,
+        "default listing must be the 29-tool surface (aliases hidden): {chain}"
+    );
+
+    let call_resp = responses
+        .iter()
+        .find(|v| v["id"] == 3)
+        .unwrap_or_else(|| panic!("no tools/call response: {chain}"));
+    assert_eq!(
+        call_resp["result"]["isError"], false,
+        "a hidden alias must still dispatch successfully: {chain}"
+    );
+    assert!(
+        call_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("terminal"),
+        "mind_vault_store must still return its terminal-only instructions: {chain}"
+    );
+
+    // MGIMIND_LIST_DEPRECATED=1: the alias reappears in tools/list.
+    let list_only = format!(
+        "{}\n{}\n{}\n",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    );
+    let mut child2 = Command::new(bin())
+        .arg("mcp")
+        .env("MGIMIND_HOME", &mind)
+        .env("ORT_DYLIB_PATH", &ort)
+        .env("MGIMIND_LIST_DEPRECATED", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn mgimind mcp (MGIMIND_LIST_DEPRECATED=1)");
+    child2
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(list_only.as_bytes())
+        .expect("write requests");
+    let out2 = child2.wait_with_output().expect("wait mcp 2");
+    let stdout2 = String::from_utf8_lossy(&out2.stdout).into_owned();
+    let stderr2 = String::from_utf8_lossy(&out2.stderr).into_owned();
+    let chain2 = format!("stdout: {stdout2}\n--- stderr ---\n{stderr2}");
+
+    let responses2: Vec<serde_json::Value> = stdout2
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("non-JSON on stdout: {e}\n{l}")))
+        .collect();
+    let resp2 = responses2
+        .iter()
+        .find(|v| v["id"] == 2)
+        .unwrap_or_else(|| panic!("no tools/list response: {chain2}"));
+    let tools2 = resp2["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools/list result has no tools array: {chain2}"));
+    assert!(
+        tools2.iter().any(|t| t["name"] == "mind_vault_store"),
+        "MGIMIND_LIST_DEPRECATED=1 must restore mind_vault_store to the listing: {chain2}"
+    );
+    assert_eq!(
+        tools2.len(),
+        44,
+        "MGIMIND_LIST_DEPRECATED=1 must restore the full 44-tool surface: {chain2}"
+    );
+}
