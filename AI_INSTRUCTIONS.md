@@ -525,7 +525,11 @@ just saw, or the validation rejects the call.
 The store exposes consolidated verbs with an `action` argument. Prefer them. The
 older single-purpose tools (`mind_fact_add`, `mind_quarantine_list`,
 `mind_session_start`, `mind_vault_get`, `mind_create`, and their siblings) still work
-but are deprecated and slated for removal in v2.0.
+but are deprecated and slated for removal in v2.0. Since v2.8.1 they are also hidden
+from `tools/list` by default (29 tools advertised instead of 44), so a client built
+against this file should not expect to see them listed; calling one directly by name
+still dispatches. Set `MGIMIND_LIST_DEPRECATED=1` in the server's environment to list
+them again.
 
 Memory: `mind_search`, `mind_recall_all` (memories + facts + procedures in one call),
 `mind_should_search` (advisory: should I search this query?), `mind_add`,

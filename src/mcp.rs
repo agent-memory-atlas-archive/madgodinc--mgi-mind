@@ -149,7 +149,9 @@ async fn handle_message(config: Option<&MindConfig>, msg: Value) -> Option<Value
         // Lifecycle notifications: no reply.
         "notifications/initialized" | "notifications/cancelled" => None,
         "ping" => id.map(|id| success_response(id, json!({}))),
-        "tools/list" => id.map(|id| success_response(id, json!({ "tools": tool_definitions() }))),
+        "tools/list" => {
+            id.map(|id| success_response(id, json!({ "tools": visible_tool_definitions() })))
+        }
         "tools/call" => {
             let id = id?;
             // Panic isolation (single-process risk): one `mgimind mcp` process
@@ -1265,9 +1267,43 @@ pub async fn dispatch(config: Option<&MindConfig>, name: &str, args: &Value) -> 
     }
 }
 
-/// The 30 tool definitions advertised by `tools/list`. Schemas are hand-written
-/// from the zod schemas in `mcp-server/index.js` (1:1, so signatures don't
-/// drift). `inputSchema` is a JSON Schema object per tool.
+/// Whether `tools/list` should advertise the deprecated v1.0 singleton
+/// aliases (mind_fact_add, mind_session_start, mind_create, ...) alongside
+/// their v1.1+ replacement. A tool-definition quality judge (Glama) penalizes
+/// a 44-tool surface where a third of the names are just old spellings of the
+/// other two thirds, hurting both the "tool count" and "disambiguation"
+/// sub-scores. Dispatch (`call_tool`, above) answers every alias regardless
+/// of this setting, so no existing script or client that calls an alias by
+/// name breaks; this only controls what gets ADVERTISED. Default is hidden;
+/// set MGIMIND_LIST_DEPRECATED=1 to restore the old (full) listing, e.g. for a
+/// client that specifically wants to see and migrate off the legacy names.
+fn list_deprecated_aliases() -> bool {
+    std::env::var("MGIMIND_LIST_DEPRECATED")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// `tools/list` response: `tool_definitions()` filtered by
+/// `list_deprecated_aliases()`. Kept separate from `tool_definitions()` so
+/// tests and other internal callers that need the full, env-independent set
+/// (dispatch-parity checks, schema-shape checks) are unaffected by the env
+/// var.
+fn visible_tool_definitions() -> Vec<Value> {
+    if list_deprecated_aliases() {
+        return tool_definitions();
+    }
+    tool_definitions()
+        .into_iter()
+        .filter(|t| t.get("deprecated").and_then(Value::as_bool) != Some(true))
+        .collect()
+}
+
+/// The full tool surface (including deprecated aliases), as still dispatched
+/// by `call_tool`. What `tools/list` actually advertises is
+/// `visible_tool_definitions()`, which hides the deprecated entries by
+/// default. Schemas are hand-written from the zod schemas in
+/// `mcp-server/index.js` (1:1, so signatures don't drift). `inputSchema` is a
+/// JSON Schema object per tool.
 fn tool_definitions() -> Vec<Value> {
     // List order matters: well-behaved MCP clients render tools in the order
     // returned by tools/list, and many model prompts surface the first dozen
@@ -1283,7 +1319,7 @@ fn tool_definitions() -> Vec<Value> {
     let tools = vec![
         json!({
             "name": "mind_search",
-            "description": "Semantic search across memories, with optional metadata filters (author, source, date window, multiple libraries).",
+            "description": "Semantic (embedding) search across stored memories, ranked by relevance to `query`, with optional metadata filters. Read-only, no side effects. Returns up to `limit` results as text (library, score, id, content, author if set), or the literal 'No results.' when nothing matches. Use mind_browse instead for a query-less metadata listing (newest first, not ranked); mind_recall for error->fix procedures; mind_recall_all to search memories, facts, and procedures in one call.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1349,13 +1385,13 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mind_add",
-            "description": "Add a memory entry",
+            "description": "Store free-text content as a searchable memory. Content-addressed: the point id is derived from (library, content), so re-adding the exact same text upserts the same entry instead of duplicating it (and clears any archived or quarantined flag); any character change creates a new entry. Long content is split into overlapping chunks automatically. Fails if `library` does not exist (create it first with mind_library action=\"create\") or if `content` looks like a secret (refused; use mind_vault instead, which never stores secrets through MCP). Returns a one-line confirmation with the chunk count. Use mind_ingest for raw text you want auto-extracted into memories/facts/procedures; mind_learn for an error->fix lesson; mind_fact for a structured subject-predicate-object triple.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "library": { "type": "string", "description": "Library name" },
-                    "content": { "type": "string", "description": "Content to store" },
-                    "source": { "type": "string", "description": "Source tag" }
+                    "library": { "type": "string", "description": "Target library name. Must already exist; it is never auto-created. Create one with mind_library action=\"create\"." },
+                    "content": { "type": "string", "description": "Text to store, any length (chunked automatically if long). Rejected if it looks like a password, key, or token." },
+                    "source": { "type": "string", "description": "Optional free-text provenance tag (e.g. a URL or session id). Filterable later via mind_search/mind_browse source, and shown in mind_history." }
                 },
                 "required": ["library", "content"]
             }
@@ -1454,10 +1490,10 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mind_doctor",
-            "description": "Check system health",
+            "description": "Diagnose the local install: Qdrant reachable, embedding model and ONNX Runtime present, config valid. Read-only report by default. With fix=true it also DOWNLOADS missing pieces (Qdrant binary, embedding model, ONNX Runtime) to repair them; it never touches stored memories, facts, or the vault. Call this when a tool call fails with a connection/model/config error, before asking the user to reinstall anything.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "fix": { "type": "boolean", "default": false } }
+                "properties": { "fix": { "type": "boolean", "default": false, "description": "false (default): report problems only, no changes. true: also download and install any missing dependency found broken (Qdrant, model, ONNX Runtime); does not touch memory data." } }
             }
         }),
         json!({
@@ -1474,7 +1510,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mind_context",
-            "description": "Generate compact context briefing for session start",
+            "description": "Build a text briefing for session start: operating rule, pinned mind_block entries, skill catalogue, last session summary, library list, and up to 20 current knowledge-graph facts. Side effect: every fact it surfaces is marked 'inherited', so a later mind_fact re-assertion of the same fact counts as reused context rather than an independent reconfirmation (discounted in the duel rule) until it is freshly re-asserted. Does not open or close a session; call mind_session action=\"start\" for that.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({
@@ -1495,7 +1531,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mind_learn",
-            "description": "Record a procedural-memory lesson (error -> fix). Stored unverified by default (a manual lesson has no truth signal); surfaced with low weight until confirmed. Pass verified=true ONLY with a deterministic signal (test green / exit 0).",
+            "description": "Record a procedural-memory lesson (error -> fix) for later mind_recall. Stored unverified by default (a manual lesson has no truth signal) and surfaced with low weight until confirmed; pass verified=true ONLY with a deterministic signal (test green / exit 0), or confirm it later with mind_outcome. Always inserts a new entry, never merges with an existing similar one. Returns the new procedure's id. Use mind_skill action=\"set\" instead for a reusable house-rule playbook that is not tied to a specific error.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1510,7 +1546,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mind_recall",
-            "description": "Recall error->fix playbooks for an error and/or a task context. Ranking blends relevance with trust: a verified or proven fix gets a boost, a repeatedly-failing one is demoted, but a strongly-matching unverified fix still surfaces.",
+            "description": "Recall error->fix playbooks for an error that already happened, matched by error signature and/or task context. Read-only. Ranking blends relevance with trust: a verified or proven fix is boosted, a repeatedly-failing one demoted, but a strongly-matching unverified fix still surfaces. Returns up to `limit` playbooks as text, or a no-match message. Use mind_skill action=\"match\" instead for a task you are about to start, before any error has occurred.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1522,7 +1558,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mind_procedure_outcome",
-            "description": "Record whether a recalled procedure worked when reused. worked=false raises its fail count and demotes it, so the store self-corrects instead of ossifying on a bad fix.",
+            "description": "Record whether a procedure returned by mind_recall worked when reused. worked=true/false bumps its success/fail counter and feeds its trust ranking, so the store self-corrects instead of ossifying on a bad fix; not idempotent, each call adds another data point. For anything other than a plain worked/did-not-work signal on a procedure (a typed signal like test_passed/code_compiled, a signal on a non-procedure memory, or idempotent re-posting), use mind_outcome instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1534,7 +1570,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mind_outcome",
-            "description": "v1.5: Record a typed external-signal outcome on any memory (not only procedures). Use this when a test passed/failed, code compiled, a user explicitly confirmed/denied a fact, or a citing memory referenced this one. Idempotent on (memory_id, signal_type, source): re-posting the same triple updates the existing entry rather than appending a duplicate. Signals contribute to the fact's external_signal_score, which feeds the duel rule and the §3 Mechanism 2 doubt-window guardrail. When memory_id is a PROCEDURE and signal_type is test_passed or code_compiled, this also bumps the procedure's success/fail counters: so a green test after a mind_learn fix marks that playbook verified without a separate mind_procedure_outcome call. Pass the procedure id returned by mind_learn.",
+            "description": "Record a typed external-signal outcome on any memory id, not only procedures: a test passed/failed, code compiled, a user confirmed/denied a fact, or a citing memory referenced this one. Idempotent on (memory_id, signal_type, source): re-posting the same triple updates the existing entry instead of appending a duplicate. Feeds the fact duel rule's external_signal_score. If memory_id is a procedure and signal_type is test_passed or code_compiled, this also bumps its success/fail counters, same as mind_procedure_outcome would; use mind_procedure_outcome instead only for a plain worked/did-not-work signal with no typed signal_type.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1552,10 +1588,10 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mind_history",
-            "description": "Show recent additions chronologically",
+            "description": "List the most recently added memories (not facts, procedures, or skills), newest first by creation time. Read-only. Returns up to `limit` entries as text (library, content, source), or 'No memories yet.' when empty. Does not include a memory id; use mind_search or mind_browse when you need ids to act on.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "limit": { "type": "number", "default": 10 } }
+                "properties": { "limit": { "type": "number", "default": 10, "description": "Max entries to return, newest first." } }
             }
         }),
         json!({
@@ -1608,36 +1644,37 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mind_web",
-            "description": "Read a webpage as Markdown, optionally save to library",
+            "description": "Fetch a webpage and convert it to Markdown via the external `crw` tool. Fails with an install hint if `crw` is missing or not on PATH, and fails if the page returns empty content. With `save` set, also stores the page as a memory (same rules as mind_add: `save` must already exist as a library, content is chunked, source is set to the URL) and returns a chunk-count confirmation instead of the page text.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "url": { "type": "string", "description": "URL to read" },
-                    "save": { "type": "string", "description": "Library to save into (omit to just read)" }
+                    "url": { "type": "string", "description": "URL to fetch" },
+                    "save": { "type": "string", "description": "Library to store the page into. Must already exist; omit to just read the page without storing it." }
                 },
                 "required": ["url"]
             }
         }),
         json!({
             "name": "mind_export",
-            "description": "Export all data to JSON or Markdown files",
+            "description": "Export memories to disk, one file per library. Formats json/md dump every stored memory (including archived and quarantined ones; facts, procedures, and skills are not included) grouped by library; format=instructions renders verified error->fix procedures only; format=profile renders a snapshot of pinned blocks + current facts + verified procedures + skills. Writes files under `output`, OVERWRITING any existing file of the same name without warning or backup. Never touches the vault.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "format": { "type": "string", "default": "json", "description": "json or md" },
-                    "output": { "type": "string", "default": "./mgimind-export", "description": "Output directory" }
+                    "format": { "type": "string", "default": "json", "enum": ["json", "md", "instructions", "profile"], "description": "json/md: one file per library with every memory. instructions: verified procedures as agent-ready markdown. profile: blocks+facts+procedures+skills snapshot." },
+                    "output": { "type": "string", "default": "./mgimind-export", "description": "Output directory for json/md (one file per library) or output file path for instructions/profile. Created if missing; existing files are overwritten." }
                 }
             }
         }),
         json!({
             "name": "mind_import",
-            "description": "Import markdown files from a directory (Obsidian, etc.)",
+            "description": "Reconcile a directory of Markdown files (Obsidian vault or plain folder) into a library: the files on disk WIN, so a file that differs from what is already stored replaces the stored version. Auto-creates `library` if missing. Defaults to a dry-run (apply=false) that only renders the plan (counts of new/replaced entries); pass apply=true to actually write. Idempotent: re-running with no file changes plans and writes nothing. Different from mind_ingest, which extracts memories/facts/procedures from one block of text rather than reconciling a directory tree.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "source": { "type": "string", "default": "obsidian", "description": "Source type: obsidian, markdown" },
-                    "path": { "type": "string", "description": "Path to vault/directory" },
-                    "library": { "type": "string", "default": "imported", "description": "Target library name" }
+                    "source": { "type": "string", "default": "obsidian", "enum": ["obsidian", "markdown"], "description": "File layout to expect. obsidian and markdown are currently treated the same." },
+                    "path": { "type": "string", "description": "Directory to scan for .md files" },
+                    "library": { "type": "string", "default": "imported", "description": "Target library name. Created automatically if it does not exist." },
+                    "apply": { "type": "boolean", "default": false, "description": "false (default): dry-run, only shows what would change. true: actually write the new/replaced entries." }
                 },
                 "required": ["path"]
             }
@@ -1667,7 +1704,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mind_stats",
-            "description": "Show memory statistics",
+            "description": "Read-only summary: memory count per library and total, knowledge-graph fact count (plus a dependants/confidence distribution when facts exist), session file count, and whether the vault is initialized (never the secret count or values). No parameters. Use mind_consolidate instead to see duplicate/cold-memory counts.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
     ];
@@ -1717,14 +1754,14 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mind_fact",
-            "description": "Knowledge-graph facts (subject -> predicate -> object). Single tool with `action`: add (insert a new fact; refuses with verdict=invalidated if this exact triple was explicitly invalidated - use action=restore first), query (list facts about a subject), invalidate (soft-delete a fact by id when a single-valued fact has been superseded), restore (undo an invalidate - the only way back). Replaces mind_fact_add / _query / _invalidate.",
+            "description": "Knowledge-graph facts (subject -> predicate -> object). Single tool with `action`: add (insert a new fact; returns verdict=invalidated and refuses if this exact triple was explicitly invalidated before - call action=restore first), query (text-matches `subject` against subject/predicate/object, returns current facts as text, or the superseded history with history=true, or a point-in-time snapshot with as_of), invalidate (soft-delete a fact by id, for a single-valued fact that has been superseded), restore (the only way to undo invalidate). Replaces mind_fact_add / _query / _invalidate.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["add", "query", "invalidate", "restore"], "description": "Operation" },
-                    "subject": { "type": "string", "description": "Required for add/query" },
-                    "predicate": { "type": "string", "description": "Required for add" },
-                    "object": { "type": "string", "description": "Required for add" },
+                    "subject": { "type": "string", "description": "add: the entity the triple is about, required together with predicate and object. query: a text match, checked against subject OR predicate OR object (not subject-only, not exact), required." },
+                    "predicate": { "type": "string", "description": "Required for add, together with subject and object. Relationship name; its registered cardinality (see mind_predicate) decides whether a second distinct object conflicts." },
+                    "object": { "type": "string", "description": "Required for add, together with subject and predicate. The value or related entity." },
                     "id": { "type": "string", "description": "Required for invalidate/restore (from action=query)" },
                     "valid_from": { "type": "string", "description": "With action=add: optional, when this became true IN THE WORLD (RFC3339 or YYYY-MM-DD), as opposed to when it was recorded. Omit for 'unknown'." },
                     "history": { "type": "boolean", "description": "With action=query: return the SUPERSEDED history (past TemporalSingle values, oldest first) instead of current facts" },
@@ -1750,13 +1787,13 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mind_predicate",
-            "description": "v1.4: register and inspect predicate cardinality (single | temporal-single | multi). Cardinality controls how `mind_fact(action=\"add\")` detects conflicts: Multi predicates never conflict; Single/TemporalSingle flag a `conflict_pending` event when a second distinct object is asserted. Default for unregistered predicates is Multi.",
+            "description": "Register and inspect predicate cardinality (single | temporal-single | multi), which controls how mind_fact action=\"add\" detects conflicts: Multi never conflicts; Single/TemporalSingle flag a conflict when a second distinct object is asserted for the same subject+predicate. Unregistered predicates default to Multi. Call action=register once per predicate before relying on conflict detection for it (e.g. right after introducing a new predicate you want single-valued); action=get to check one predicate; action=list to see everything registered. register is a silent overwrite: re-registering an existing predicate with a different cardinality replaces it immediately, no confirmation, no history of the old value.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["register", "get", "list"], "description": "Operation" },
-                    "predicate": { "type": "string", "description": "Required for action=register and action=get" },
-                    "cardinality": { "type": "string", "enum": ["single", "temporal-single", "multi"], "description": "Required for action=register" }
+                    "action": { "type": "string", "enum": ["register", "get", "list"], "description": "Operation. Required, no default." },
+                    "predicate": { "type": "string", "description": "Required for action=register and action=get. The predicate name as used in mind_fact." },
+                    "cardinality": { "type": "string", "enum": ["single", "temporal-single", "multi"], "description": "Required for action=register. Overwrites any existing registration for this predicate." }
                 },
                 "required": ["action"]
             }
@@ -1836,8 +1873,13 @@ fn tool_definitions() -> Vec<Value> {
                     .and_then(|d| d.as_str())
                     .unwrap_or("")
                     .to_string();
-                let new_desc =
-                    format!("DEPRECATED: use {replacement}. Removed in v2.0. ({old_desc})");
+                // No nested parens, no "Removed" (it is still callable today,
+                // only scheduled): avoids the "confusing parenthetical" /
+                // "contradicts still callable" complaints a tool-quality judge
+                // raised about the old wording.
+                let new_desc = format!(
+                    "DEPRECATED, use {replacement} instead; scheduled for removal in v2.0 but still fully functional today. {old_desc}"
+                );
                 obj.insert("description".to_string(), Value::String(new_desc));
             }
             deprecated.push(tool);
@@ -1992,15 +2034,36 @@ mod tests {
 
     #[tokio::test]
     async fn tools_list_returns_v1_5_surface() {
-        // 30 legacy v1.0 singletons (15 deprecated, alias phase) + 5
-        // consolidated v1.1 verbs + 1 v1.4 (mind_predicate) +
-        // 1 v1.5 (mind_outcome) + 1 (mind_recall_all) + 1 (mind_should_search)
-        // + 1 (mind_visualize) + 1 (mind_browse) + 1 (mind_restore)
-        // + 1 (mind_block) + 1 (mind_skill) = 44 total.
-        // Removal of the 15 deprecated singletons is deferred (see ROADMAP v2.x).
+        // Default behavior (MGIMIND_LIST_DEPRECATED unset, the normal case for
+        // a dev shell / CI runner): the 15 deprecated v1.0 singletons are
+        // hidden from tools/list, leaving 29 (20 v1.1 + mind_predicate +
+        // mind_outcome + mind_recall_all + mind_should_search +
+        // mind_visualize + mind_browse + mind_restore + mind_block +
+        // mind_skill). They still dispatch via call_tool either way (see
+        // `deprecated_alias_still_dispatches_when_hidden_from_listing` and
+        // the full superset in `exposes_consolidated_and_legacy_tools`); only
+        // the advertised listing shrinks. `MGIMIND_LIST_DEPRECATED=1` restores
+        // the full 44-tool listing, tested via a subprocess in
+        // tests/cli_integration.rs (an in-process env var flip here would race
+        // with other tests reading the same process-global var).
+        assert!(
+            std::env::var("MGIMIND_LIST_DEPRECATED").is_err(),
+            "test environment must not have MGIMIND_LIST_DEPRECATED set"
+        );
         let msg = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
         let resp = handle_message(None, msg).await.unwrap();
-        assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 44);
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.len(),
+            29,
+            "deprecated aliases must be hidden by default"
+        );
+        assert!(
+            tools
+                .iter()
+                .all(|t| t.get("deprecated").and_then(Value::as_bool) != Some(true)),
+            "no tool in the default listing should be flagged deprecated"
+        );
     }
 
     #[tokio::test]

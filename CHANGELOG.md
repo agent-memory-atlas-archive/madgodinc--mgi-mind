@@ -1,5 +1,46 @@
 # Changelog
 
+## 2.8.1 (unreleased)
+
+Raises the MCP tool-definition quality (Glama TDQS): rewrote descriptions for
+the lowest-scoring tools and tightened parameter-level documentation across the
+rest, without changing any tool's actual behavior except where noted.
+
+### Changed
+
+- **Deprecated v1.0 singleton aliases are hidden from `tools/list` by
+  default.** 15 of the 44 advertised tools were old single-purpose names
+  (`mind_fact_add`, `mind_session_start`, `mind_create`, ...) for the v1.1+
+  consolidated verbs, which a tool-definition judge penalizes for both tool
+  count and name disambiguation. They now appear only with
+  `MGIMIND_LIST_DEPRECATED=1` set in the server's environment. Dispatch is
+  unaffected: every alias still answers `tools/call` exactly as before, so no
+  existing script or client that calls one by name without listing first
+  breaks. Default surface: 29 tools (was 44).
+- Reworded the shared deprecation-notice prefix on the now-hidden aliases:
+  dropped the nested parenthetical and the "Removed in v2.0" phrasing (false
+  while the tool is still callable) in favor of "scheduled for removal... but
+  still fully functional today".
+- `AI_INSTRUCTIONS.md`: noted the new default-hidden-alias behavior and the
+  opt-out env var.
+
+### Fixed
+
+- `mind_import`'s `apply` parameter was read by the handler but missing from
+  its MCP schema entirely, so an agent had no documented way to move past the
+  dry-run default. Added to the schema.
+
+### Docs
+
+- Rewrote the top-level description and/or parameter descriptions for
+  `mind_search`, `mind_add`, `mind_doctor`, `mind_history`, `mind_import`,
+  `mind_export`, `mind_stats`, `mind_context`, `mind_web`, `mind_recall`,
+  `mind_learn`, `mind_fact`, `mind_predicate`, `mind_procedure_outcome`, to
+  disclose side effects, idempotency, failure modes, return shape, and which
+  sibling tool to use instead, per a Glama tool-quality review. `mind_export`
+  and `mind_import` now also document behavior (formats, overwrite,
+  conflict handling) the schema previously omitted entirely.
+
 ## 2.8.0 (2026-10-20)
 
 Answers an external code review (neoneye/agent-memory-atlas) of commit
