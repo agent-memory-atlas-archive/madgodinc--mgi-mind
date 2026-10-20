@@ -336,7 +336,7 @@ pub async fn run_ingest_authored(
                     // quarantine (deterministic id), this is the promotion
                     // signal — user is insistent, raise confidence.
                     let qid = crate::storage::quarantine_id_for(library, content.trim());
-                    if crate::storage::promote_from_quarantine(config, &qid)
+                    if crate::storage::promote_from_quarantine(config, &qid, Some("relevance-gate"))
                         .await
                         .unwrap_or(false)
                     {
@@ -503,8 +503,16 @@ pub async fn run_ingest_authored(
                 }
                 // Learned unverified (no truth signal at ingest time); surfaced
                 // with low weight until a real signal confirms it (Д6).
-                crate::procedure::learn(config, &trigger_error, &fix, &context, None, false)
-                    .await?;
+                crate::procedure::learn(
+                    config,
+                    &trigger_error,
+                    &fix,
+                    &context,
+                    None,
+                    false,
+                    Some("ingest"),
+                )
+                .await?;
                 report.stored_procedures += 1;
             }
         }

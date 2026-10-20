@@ -421,21 +421,35 @@ async fn search_json(state: &AppState, args: &Value) -> Response {
 /// `procedures` has no stable struct yet, so it ships as a rendered string under
 /// the deliberately-named `procedures_text` — the name says it is text, not a
 /// structured field, so a parser is never misled about its shape.
-async fn recall_json(state: &AppState, args: &Value) -> Response {
+///
+/// `scoped` is true for a library-scoped token. Facts and procedures are
+/// GLOBAL stores: `Fact` and `ProcedureHit` carry no library field, so there
+/// is no predicate that could confine them to an allowlist. Rather than leak
+/// every library's facts/procedures to a token scoped to one, a scoped caller
+/// gets neither silo; only `memories` honours the library filter (via
+/// `apply_scope` injecting `libraries` into `args` before this is called). The
+/// shape stays stable (empty array / empty string), never a missing field.
+async fn recall_json(state: &AppState, args: &Value, scoped: bool) -> Response {
     let (query, _library, limit, _tier) = match read_args(args) {
         Ok(t) => t,
         Err(()) => return bad_request("missing required argument 'query'"),
     };
     let cfg = &state.config;
 
-    let facts: Vec<Value> = match crate::knowledge::query_facts(cfg, &query).await {
-        Ok(fs) => fs
-            .iter()
-            .filter(|f| f.valid)
-            .take(limit)
-            .map(|f| json!({ "subject": f.subject, "predicate": f.predicate, "object": f.object }))
-            .collect(),
-        Err(_) => Vec::new(),
+    let facts: Vec<Value> = if scoped {
+        Vec::new()
+    } else {
+        match crate::knowledge::query_facts(cfg, &query).await {
+            Ok(fs) => fs
+                .iter()
+                .filter(|f| f.valid)
+                .take(limit)
+                .map(|f| {
+                    json!({ "subject": f.subject, "predicate": f.predicate, "object": f.object })
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
     };
 
     // Honour the same metadata filters as /memory/search (author, source,
@@ -447,16 +461,20 @@ async fn recall_json(state: &AppState, args: &Value) -> Response {
             .await
             .unwrap_or_default();
 
-    let procedures = match crate::procedure::recall(cfg, None, Some(&query), limit).await {
-        Ok(p) => {
-            let t = p.trim();
-            if t.is_empty() || t.to_lowercase().starts_with("no ") {
-                String::new()
-            } else {
-                t.to_string()
+    let procedures = if scoped {
+        String::new()
+    } else {
+        match crate::procedure::recall(cfg, None, Some(&query), limit).await {
+            Ok(p) => {
+                let t = p.trim();
+                if t.is_empty() || t.to_lowercase().starts_with("no ") {
+                    String::new()
+                } else {
+                    t.to_string()
+                }
             }
+            Err(_) => String::new(),
         }
-        Err(_) => String::new(),
     };
 
     Json(json!({
@@ -813,7 +831,7 @@ async fn memory_recall(
     // can route each silo on its own. `format: "text"` falls back to the rendered
     // block; an unknown format is a 400.
     match resolve_format(&args) {
-        Ok(Format::Json) => recall_json(&state, &args).await,
+        Ok(Format::Json) => recall_json(&state, &args, is_scoped(&state, &derived)).await,
         // The text render (mind_recall_all) fuses memories from ALL libraries and
         // ignores the injected `libraries` filter, so it can not be confined. A
         // scoped token must use the JSON path (search_filtered honours the scope).
@@ -916,13 +934,20 @@ async fn memory_delete(
     headers: HeaderMap,
     Json(args): Json<Value>,
 ) -> Response {
-    if let Err(c) = check_auth(&state, &headers) {
-        return c.into_response();
-    }
+    let derived = match check_auth(&state, &headers) {
+        Ok(d) => d,
+        Err(c) => return c.into_response(),
+    };
     let Some(ids) = ids_arg(&args) else {
         return bad_request("ids is required");
     };
-    match crate::storage::delete_memories(&state.config, &ids).await {
+    // Token-derived identity first (trustworthy), else the self-asserted
+    // X-Agent hint, else a generic "http" - never "cli"/"unknown", which would
+    // read as if this came from a different surface entirely.
+    let actor = derived
+        .or_else(|| agent_of(&headers))
+        .unwrap_or_else(|| "http".to_string());
+    match crate::storage::delete_memories(&state.config, &ids, &actor).await {
         Ok(()) => Json(json!({ "ok": true, "deleted": ids.len() })).into_response(),
         Err(e) => bad_request(&format!("{e:#}")),
     }
@@ -1012,12 +1037,17 @@ async fn fact_add(
             .and_then(|v| v.as_str())
             .map(str::to_string)
     });
+    // §5d: optional world-time bound (RFC3339 or a bare date). Absent by
+    // default - preserves whatever this triple already carried, or leaves it
+    // unset for a genuinely new one.
+    let valid_from = args.get("valid_from").and_then(|v| v.as_str());
     match crate::knowledge::add_fact_authored_verdict(
         &state.config,
         subject,
         predicate,
         object,
         author.as_deref(),
+        valid_from,
     )
     .await
     {
@@ -1179,16 +1209,25 @@ async fn quarantine_list(
 }
 
 /// `mind_quarantine_promote`: promote one quarantined entry to ordinary memory
-/// by id. Non-destructive (it surfaces an already-stored entry).
+/// by id. Non-destructive (it surfaces an already-stored entry). Carries the
+/// token-derived identity into the audit trail the same way `memory_add` does,
+/// so a promote over HTTP is attributed to the real caller rather than the
+/// generic "mcp" default.
 async fn quarantine_promote(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(args): Json<Value>,
 ) -> Response {
-    if let Err(c) = check_auth(&state, &headers) {
-        return c.into_response();
-    }
-    call(&state, "mind_quarantine_promote", args).await
+    let derived = match check_auth(&state, &headers) {
+        Ok(d) => d,
+        Err(c) => return c.into_response(),
+    };
+    call(
+        &state,
+        "mind_quarantine_promote",
+        with_agent(args, &headers, derived),
+    )
+    .await
 }
 
 /// `mind_restore`: un-archive a soft-forgotten memory by id (non-destructive).

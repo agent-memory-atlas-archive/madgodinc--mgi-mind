@@ -278,7 +278,7 @@ pub async fn run(config: &MindConfig, opts: Options) -> Result<Report> {
     // so a flag mix never silently deletes what the user meant to archive.
     if opts.apply {
         let to_delete: Vec<String> = removed.iter().cloned().collect();
-        storage::delete_memories(config, &to_delete).await?;
+        storage::delete_memories(config, &to_delete, "consolidate").await?;
         if opts.archive_cold {
             // Archive gets the full recency-weighted set (reversible).
             report.cold_archived = storage::archive_memories(config, &cold).await?;
@@ -286,10 +286,33 @@ pub async fn run(config: &MindConfig, opts: Options) -> Result<Report> {
             // Delete only the conservative binary subset — never more than the
             // pre-recency model would have, with no silent expansion.
             report.cold_pruned = cold_prune.len();
-            storage::delete_memories(config, &cold_prune).await?;
+            storage::delete_memories(config, &cold_prune, "consolidate").await?;
         }
         // Persist any in-memory access counts before we finish.
         crate::access::flush();
+
+        // Atlas review: AuditOp::Consolidate was declared but had no producer -
+        // a consolidate --apply run left no single summary row, only the
+        // per-id Delete/Archive rows above (and before this task, not even
+        // those). One row per pass, naming every count, so `audit list` shows
+        // "a consolidate ran" as a single event instead of requiring a reader
+        // to infer it from a burst of Delete/Archive rows.
+        crate::audit::record(
+            crate::audit::AuditEvent::new(
+                crate::audit::AuditOp::Consolidate,
+                opts.library.clone().unwrap_or_default(),
+                "consolidate-pass",
+            )
+            .actor("consolidate")
+            .note(format!(
+                "scanned {}: {} exact dup(s), {} near-dup(s) merged, {} cold archived, {} cold pruned",
+                report.scanned,
+                report.exact_dups_removed,
+                report.near_dups_removed,
+                report.cold_archived,
+                report.cold_pruned,
+            )),
+        );
     }
 
     Ok(report)

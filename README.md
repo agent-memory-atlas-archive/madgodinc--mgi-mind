@@ -87,8 +87,16 @@ on their own:
   of piling up a second "truth". An entrenched fact (many dependants,
   confirmations, age) holds; a strong fresh fact flips it and dampens the
   loser to a hidden `stale` status; a borderline one is marked contested or
-  diverted to quarantine. Nothing is deleted, so the audit log keeps the
-  loser. Automatic, inside a normal `mind_fact add`.
+  diverted to quarantine. Confirmations accrue live: re-asserting the same
+  triple raises its own `confirmations_count`, so a fact confirmed a few
+  times resists a single fresh contradiction (contested, not flipped) while
+  an unconfirmed young fact still flips as easily as before. `dependants`
+  still only comes from the `migrate-v14 dependants --apply` backfill - a
+  cheap live producer (it would mean walking the graph on every write) is not
+  implemented. Nothing is deleted, so the audit log keeps the loser; a
+  re-proposed `stale` loser gets a fair new duel against whatever is current,
+  keeping its own original `created_at` and confirmation history rather than
+  starting over. Automatic, inside a normal `mind_fact add`.
 - **Doubt window.** An entrenched fact has to keep re-justifying itself. Every
   fact query measures how far the current context has drifted from the context
   the fact was written in; after five consecutive drifted retrievals the fact
@@ -104,14 +112,32 @@ on their own:
   `doubt_drift_mode` to `"enforce"`. A background pass separately
   re-tests entrenched facts that have gone quiet, under hard guarantees: never
   during a tool call, a per-tick cap, and a load-aware cadence.
-- **Inheritance discount.** Facts carried into a session from memory count at
-  half weight and cannot co-confirm each other. One stale source agreeing
-  with itself is not two confirmations, so memory can't self-reinforce into
-  false certainty.
-- **Bi-temporal facts.** A predicate can be registered (`mind_predicate`) as
-  single-valued, temporal-single (one current value, but the previous ones
-  are kept and queryable by date via `mind_history`), or multi-valued. A
-  superseded value is hidden from default ranking, not erased.
+- **Inheritance discount.** `mind_context`'s briefing (what a session sees at
+  start) marks every fact it surfaces as inherited for that process. If a
+  duel challenger is a re-proposal of one of those inherited facts - the
+  agent echoing back what it was told rather than independently reconfirming
+  it live - that challenge counts at half weight. The flag clears the moment
+  the agent actually re-asserts the fact live and it lands without a
+  conflict. Single-source decay (repeated confirmation from the same source
+  counting for less each time) has the formula (`diversity_weighted_count`)
+  but no live caller yet - not implemented, no "cannot co-confirm" guarantee
+  today.
+- **Two time axes on facts.** Record-time (`created_at`/`valid_until`: when
+  the store learned/retired a value) is bi-temporal with the superseded
+  chain: a predicate can be registered (`mind_predicate`) as single-valued,
+  temporal-single (one current value, but the previous ones are kept and
+  queryable by date via `mind_history`), or multi-valued, and a superseded
+  value is hidden from default ranking, not erased. An optional second axis,
+  world-time (`valid_from`, settable on add), records when a fact became
+  true in the world instead of when the store heard about it; `mind_fact
+  action=query` with `as_of` + `world_time=true` resolves point-in-time
+  queries against it, falling back to record-time per fact when it has no
+  `valid_from`. Existing facts need no migration - they simply have no
+  `valid_from` and behave exactly as before.
+- **Explicit invalidate is final.** `mind_fact action=invalidate` is a
+  one-way door: re-adding the same triple afterward refuses (verdict
+  `invalidated`) instead of silently reviving it. `mind_fact
+  action=restore` is the only way back.
 - **Typed outcome signals.** `mind_outcome` records that a remembered fix
   actually worked (`test_passed`, `code_compiled`, `user_confirmed`,
   `cited_by`). A real success raises a memory's weight and marks a procedure
@@ -239,7 +265,9 @@ clients; the HTTP surface is the door for agent frameworks.
 ### Native install
 
 One command. The installer drops the binary on PATH and runs `init` +
-`doctor --fix` (which pulls Qdrant, ONNX Runtime, and the models).
+`doctor --fix` (which pulls Qdrant, ONNX Runtime, and the models). Or just tell
+your coding agent to install mgi-mind using [`AI_INSTRUCTIONS.md`](AI_INSTRUCTIONS.md):
+it covers the install itself, not only how to use it once installed.
 
 **Linux / macOS:**
 
@@ -484,9 +512,10 @@ never a corrupt one.
 
 | Command | What it does |
 |---|---|
-| `mgimind fact add <subject> <predicate> <object>` | Store a fact triple. Same triple overwrites (dedup). |
-| `mgimind fact query <term>` | Find facts matching a term in subject, predicate, or object. |
+| `mgimind fact add <subject> <predicate> <object> [--valid-from <date>]` | Store a fact triple. Re-adding the same triple raises its confirmation count instead of piling up a duplicate; refuses (does not revive) a triple that was explicitly invalidated. `--valid-from` optionally dates when it became true in the world. |
+| `mgimind fact query <term> [--as-of <date>] [--world-time] [--history]` | Find facts matching a term in subject, predicate, or object; `--as-of` time-travels (record-time by default, `--world-time` switches to `valid_from`). |
 | `mgimind fact invalidate <id>` | Soft-delete a fact (kept on disk, marked invalid, hidden from queries). |
+| `mgimind fact restore <id>` | Undo an invalidate - the only way back. |
 
 ### Skills
 
@@ -701,7 +730,9 @@ src/
   extractor.rs   optional local LLM extraction (off by default)
   consolidate.rs merge duplicates, report cold entries
   md_reconcile.rs md import as reconcile with "md wins"
-  audit.rs       append-only audit log for every storage mutation
+  audit.rs       append-only audit log for memory/fact/procedure/skill
+                 writes, updates, deletes and quarantine transitions (not
+                 pinned blocks, kv, vault, or sessions yet)
   http_api.rs    loopback HTTP surface for multi-agent access
   viewer.rs      ephemeral local HTTP viewer (axum, static frontend baked in)
   pulse.rs       live graph pulses for the viewer

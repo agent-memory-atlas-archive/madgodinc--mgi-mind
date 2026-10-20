@@ -364,7 +364,8 @@ pub async fn run(config: &MindConfig, opts: Options) -> Result<Report> {
             // independent duplicate: leave both points alone and report it.
             let marker = crate::storage::extract_string_pub(&target.payload, SOURCE_ID_FIELD);
             if marker.as_deref() == Some(old_id.as_str()) {
-                crate::storage::delete_memories(config, std::slice::from_ref(&old_id)).await?;
+                crate::storage::delete_memories(config, std::slice::from_ref(&old_id), "relibrary")
+                    .await?;
                 id_mapping.insert(old_id.clone(), new_id.clone());
                 report.moved += 1;
             } else {
@@ -390,7 +391,7 @@ pub async fn run(config: &MindConfig, opts: Options) -> Result<Report> {
         payload.insert(SOURCE_LIBRARY_FIELD.into(), opts.from.clone().into());
 
         crate::storage::upsert_full_point(&client, &new_id, vectors, payload).await?;
-        crate::storage::delete_memories(config, std::slice::from_ref(&old_id)).await?;
+        crate::storage::delete_memories(config, std::slice::from_ref(&old_id), "relibrary").await?;
 
         crate::audit::record(
             crate::audit::AuditEvent::new(

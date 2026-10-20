@@ -511,12 +511,17 @@ pub async fn dispatch(config: Option<&MindConfig>, name: &str, args: &Value) -> 
             let action = arg_str(args, "action").unwrap_or("list");
             let need =
                 |key: &str| arg_str(args, key).ok_or_else(|| anyhow::anyhow!("missing '{key}'"));
+            // `agent` is server-injected by the HTTP surface (`with_agent`),
+            // same convention as `mind_add` - absent on plain MCP stdio, where
+            // "mcp" is the honest default (a deliberate tool call, just not one
+            // with a known per-agent identity).
+            let agent = arg_str(args, "agent");
             match action {
                 "set" => {
                     let name = need("name")?;
                     let when = need("when")?;
                     let body = need("body")?;
-                    crate::skill::set(cfg, name, when, body).await
+                    crate::skill::set(cfg, name, when, body, Some(agent.unwrap_or("mcp"))).await
                 }
                 "match" => {
                     let task = need("task")?;
@@ -530,7 +535,8 @@ pub async fn dispatch(config: Option<&MindConfig>, name: &str, args: &Value) -> 
                     let name = need("name")?;
                     let worked = arg_bool(args, "worked", true);
                     let verify = arg_bool(args, "verify", false);
-                    crate::skill::outcome(cfg, name, worked, verify).await
+                    crate::skill::outcome(cfg, name, worked, verify, Some(agent.unwrap_or("mcp")))
+                        .await
                 }
                 other => Err(anyhow::anyhow!(
                     "unknown action '{other}' (use set|match|list|show|remove|outcome)"
@@ -703,7 +709,10 @@ pub async fn dispatch(config: Option<&MindConfig>, name: &str, args: &Value) -> 
             let cfg = warm(true)?;
             let id = arg_str(args, "id")
                 .ok_or_else(|| anyhow::anyhow!("missing required argument 'id'"))?;
-            if crate::storage::promote_from_quarantine(cfg, id).await? {
+            let agent = arg_str(args, "agent");
+            if crate::storage::promote_from_quarantine(cfg, id, Some(agent.unwrap_or("mcp")))
+                .await?
+            {
                 Ok(format!(
                     "Promoted '{id}' from quarantine to ordinary memory."
                 ))
@@ -738,18 +747,29 @@ pub async fn dispatch(config: Option<&MindConfig>, name: &str, args: &Value) -> 
             let object = arg_str(args, "object")
                 .ok_or_else(|| anyhow::anyhow!("missing required argument 'object'"))?;
             let author = arg_str(args, "agent");
-            let id = crate::knowledge::add_fact_authored(cfg, subject, predicate, object, author)
-                .await?;
-            Ok(format!(
-                "Fact added: {subject} -> {predicate} -> {object} [id: {id}]"
-            ))
+            let valid_from = arg_str(args, "valid_from");
+            let (id, verdict) = crate::knowledge::add_fact_authored_verdict(
+                cfg, subject, predicate, object, author, valid_from,
+            )
+            .await?;
+            if verdict == "invalidated" {
+                Ok(format!(
+                    "Fact NOT added: '{subject} -> {predicate} -> {object}' [id: {id}] was \
+                     explicitly invalidated. Use mind_fact(action=\"restore\", id=\"{id}\") first."
+                ))
+            } else {
+                Ok(format!(
+                    "Fact added ({verdict}): {subject} -> {predicate} -> {object} [id: {id}]"
+                ))
+            }
         }
         "mind_fact_query" => {
             let cfg = warm(true)?;
             let subject = arg_str(args, "subject")
                 .ok_or_else(|| anyhow::anyhow!("missing required argument 'subject'"))?;
             let facts = if let Some(at) = arg_str(args, "as_of") {
-                crate::knowledge::query_fact_as_of(cfg, subject, None, at).await?
+                let world_time = arg_bool(args, "world_time", false);
+                crate::knowledge::query_fact_as_of(cfg, subject, None, at, world_time).await?
             } else if arg_bool(args, "history", false) {
                 crate::knowledge::query_fact_history(cfg, subject, None).await?
             } else {
@@ -769,7 +789,17 @@ pub async fn dispatch(config: Option<&MindConfig>, name: &str, args: &Value) -> 
             let provenance = arg_str(args, "provenance");
             // verified defaults false: a manual lesson has no deterministic signal.
             let verified = arg_bool(args, "verified", false);
-            crate::procedure::learn(cfg, error, fix, context, provenance, verified).await
+            let agent = arg_str(args, "agent");
+            crate::procedure::learn(
+                cfg,
+                error,
+                fix,
+                context,
+                provenance,
+                verified,
+                Some(agent.unwrap_or("mcp")),
+            )
+            .await
         }
         "mind_recall" => {
             let cfg = warm(true)?;
@@ -786,8 +816,9 @@ pub async fn dispatch(config: Option<&MindConfig>, name: &str, args: &Value) -> 
             let id = arg_str(args, "id")
                 .ok_or_else(|| anyhow::anyhow!("missing required argument 'id'"))?;
             let worked = arg_bool(args, "worked", false);
+            let agent = arg_str(args, "agent");
             // Manual outcome — no deterministic signal, so don't verify.
-            crate::procedure::outcome(cfg, id, worked, false).await
+            crate::procedure::outcome(cfg, id, worked, false, Some(agent.unwrap_or("mcp"))).await
         }
         "mind_outcome" => {
             // v1.5 Phase 7 step 7.1: generalised external-signal API.
@@ -815,7 +846,7 @@ pub async fn dispatch(config: Option<&MindConfig>, name: &str, args: &Value) -> 
             let signal = crate::outcome::ExternalSignal {
                 signal_type,
                 success,
-                source,
+                source: source.clone(),
                 ts: chrono::Utc::now().to_rfc3339(),
             };
             let (mut out, signal_was_new) =
@@ -838,7 +869,12 @@ pub async fn dispatch(config: Option<&MindConfig>, name: &str, args: &Value) -> 
                 && crate::storage::is_procedure(cfg, memory_id).await?
             {
                 // Deterministic signal → a success both counts and verifies.
-                let note = crate::procedure::outcome(cfg, memory_id, success, success).await?;
+                // `source` doubles as the actor here: it is the closest thing
+                // to "who reported this" this bridge has (e.g. a CI source
+                // tag), closer to the truth than a flat "mcp".
+                let note =
+                    crate::procedure::outcome(cfg, memory_id, success, success, Some(&source))
+                        .await?;
                 out.push('\n');
                 out.push_str(&note);
             }
@@ -968,7 +1004,14 @@ pub async fn dispatch(config: Option<&MindConfig>, name: &str, args: &Value) -> 
                     let cfg = warm(true)?;
                     let id = arg_str(args, "id")
                         .ok_or_else(|| anyhow::anyhow!("action=promote requires 'id'"))?;
-                    if crate::storage::promote_from_quarantine(cfg, id).await? {
+                    let agent = arg_str(args, "agent");
+                    if crate::storage::promote_from_quarantine(
+                        cfg,
+                        id,
+                        Some(agent.unwrap_or("mcp")),
+                    )
+                    .await?
+                    {
                         Ok(format!(
                             "Promoted '{id}' from quarantine to ordinary memory."
                         ))
@@ -980,7 +1023,10 @@ pub async fn dispatch(config: Option<&MindConfig>, name: &str, args: &Value) -> 
                     let cfg = warm(true)?;
                     let id = arg_str(args, "id")
                         .ok_or_else(|| anyhow::anyhow!("action=expire requires 'id'"))?;
-                    if crate::storage::expire_from_quarantine(cfg, id).await? {
+                    let agent = arg_str(args, "agent");
+                    if crate::storage::expire_from_quarantine(cfg, id, Some(agent.unwrap_or("mcp")))
+                        .await?
+                    {
                         Ok(format!(
                             "Expired '{id}': confirmed the gate was right to reject it. \
                              Removed from quarantine (content + reason recorded in the audit \
@@ -1052,7 +1098,7 @@ pub async fn dispatch(config: Option<&MindConfig>, name: &str, args: &Value) -> 
         }
         "mind_fact" => {
             let action = arg_str(args, "action").ok_or_else(|| {
-                anyhow::anyhow!("missing required 'action' (add|query|invalidate)")
+                anyhow::anyhow!("missing required 'action' (add|query|invalidate|restore)")
             })?;
             match action {
                 "add" => {
@@ -1063,20 +1109,36 @@ pub async fn dispatch(config: Option<&MindConfig>, name: &str, args: &Value) -> 
                         .ok_or_else(|| anyhow::anyhow!("action=add requires 'predicate'"))?;
                     let object = arg_str(args, "object")
                         .ok_or_else(|| anyhow::anyhow!("action=add requires 'object'"))?;
-                    let id = crate::knowledge::add_fact(cfg, subject, predicate, object).await?;
-                    Ok(format!(
-                        "Fact added: {subject} -> {predicate} -> {object} [id: {id}]"
-                    ))
+                    let author = arg_str(args, "agent");
+                    let valid_from = arg_str(args, "valid_from");
+                    let (id, verdict) = crate::knowledge::add_fact_authored_verdict(
+                        cfg, subject, predicate, object, author, valid_from,
+                    )
+                    .await?;
+                    if verdict == "invalidated" {
+                        Ok(format!(
+                            "Fact NOT added: '{subject} -> {predicate} -> {object}' [id: {id}] \
+                             was explicitly invalidated. Use \
+                             mind_fact(action=\"restore\", id=\"{id}\") first."
+                        ))
+                    } else {
+                        Ok(format!(
+                            "Fact added ({verdict}): {subject} -> {predicate} -> {object} [id: {id}]"
+                        ))
+                    }
                 }
                 "query" => {
                     let cfg = warm(true)?;
                     let subject = arg_str(args, "subject")
                         .ok_or_else(|| anyhow::anyhow!("action=query requires 'subject'"))?;
                     // as_of=<instant> time-travels the superseded chain to that
-                    // moment; history=true surfaces the whole superseded chain;
-                    // otherwise the current facts.
+                    // moment (world_time=true switches it to the valid_from axis);
+                    // history=true surfaces the whole superseded chain; otherwise
+                    // the current facts.
                     let facts = if let Some(at) = arg_str(args, "as_of") {
-                        crate::knowledge::query_fact_as_of(cfg, subject, None, at).await?
+                        let world_time = arg_bool(args, "world_time", false);
+                        crate::knowledge::query_fact_as_of(cfg, subject, None, at, world_time)
+                            .await?
                     } else if arg_bool(args, "history", false) {
                         crate::knowledge::query_fact_history(cfg, subject, None).await?
                     } else {
@@ -1093,8 +1155,27 @@ pub async fn dispatch(config: Option<&MindConfig>, name: &str, args: &Value) -> 
                     )
                     .await
                 }
+                "restore" => {
+                    let cfg = warm(true)?;
+                    let id = arg_str(args, "id")
+                        .ok_or_else(|| anyhow::anyhow!("action=restore requires 'id'"))?;
+                    let agent = arg_str(args, "agent");
+                    if crate::knowledge::restore_fact_authored(
+                        cfg,
+                        id,
+                        Some(agent.unwrap_or("mcp")),
+                    )
+                    .await?
+                    {
+                        Ok(format!("Fact '{id}' restored."))
+                    } else {
+                        Ok(format!(
+                            "Nothing to restore: '{id}' is not currently invalidated (or unknown)."
+                        ))
+                    }
+                }
                 other => anyhow::bail!(
-                    "mind_fact: unknown action '{other}' (expected add|query|invalidate)"
+                    "mind_fact: unknown action '{other}' (expected add|query|invalidate|restore)"
                 ),
             }
         }
@@ -1636,17 +1717,19 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mind_fact",
-            "description": "Knowledge-graph facts (subject -> predicate -> object). Single tool with `action`: add (insert a new fact), query (list facts about a subject), invalidate (soft-delete a fact by id when a single-valued fact has been superseded). Replaces mind_fact_add / _query / _invalidate.",
+            "description": "Knowledge-graph facts (subject -> predicate -> object). Single tool with `action`: add (insert a new fact; refuses with verdict=invalidated if this exact triple was explicitly invalidated - use action=restore first), query (list facts about a subject), invalidate (soft-delete a fact by id when a single-valued fact has been superseded), restore (undo an invalidate - the only way back). Replaces mind_fact_add / _query / _invalidate.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["add", "query", "invalidate"], "description": "Operation" },
+                    "action": { "type": "string", "enum": ["add", "query", "invalidate", "restore"], "description": "Operation" },
                     "subject": { "type": "string", "description": "Required for add/query" },
                     "predicate": { "type": "string", "description": "Required for add" },
                     "object": { "type": "string", "description": "Required for add" },
-                    "id": { "type": "string", "description": "Required for invalidate (from action=query)" },
+                    "id": { "type": "string", "description": "Required for invalidate/restore (from action=query)" },
+                    "valid_from": { "type": "string", "description": "With action=add: optional, when this became true IN THE WORLD (RFC3339 or YYYY-MM-DD), as opposed to when it was recorded. Omit for 'unknown'." },
                     "history": { "type": "boolean", "description": "With action=query: return the SUPERSEDED history (past TemporalSingle values, oldest first) instead of current facts" },
-                    "as_of": { "type": "string", "description": "With action=query: POINT-IN-TIME: return the facts that were CURRENT at this instant (RFC3339 or YYYY-MM-DD), time-travelling the superseded chain. Answers 'what was X on date Y'." }
+                    "as_of": { "type": "string", "description": "With action=query: POINT-IN-TIME: return the facts that were CURRENT at this instant (RFC3339 or YYYY-MM-DD), time-travelling the superseded chain. Answers 'what was X on date Y'." },
+                    "world_time": { "type": "boolean", "description": "With action=query and as_of: use world-time (valid_from/valid_until) instead of record-time (created_at/valid_until). Falls back to record-time per fact when it has no valid_from." }
                 },
                 "required": ["action"]
             }

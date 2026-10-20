@@ -156,6 +156,7 @@ pub async fn run(
             item.context.as_deref().unwrap_or(""),
             Some(BENCH_LIB),
             false,
+            Some("bench"),
         )
         .await;
         if (i + 1) % 50 == 0 || i + 1 == total {

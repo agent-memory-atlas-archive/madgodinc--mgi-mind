@@ -101,6 +101,12 @@ pub fn rank(mut hits: Vec<ProcedureHit>) -> Vec<ProcedureHit> {
 
 /// Record a lesson: error -> fix. `verified` is false for a manual `mind_learn`
 /// (no truth signal yet). Returns a confirmation with the procedure id.
+///
+/// `actor` is who/what is learning this: the real MCP/HTTP-derived agent name
+/// for a deliberate `mind_learn` call, or `"ingest"` for the auto-extraction
+/// path. `None` falls back to the audit log's own default ("unknown" here,
+/// since - unlike `mind_add` - this surface has no established actor
+/// convention of its own yet).
 pub async fn learn(
     config: &MindConfig,
     error: &str,
@@ -108,12 +114,24 @@ pub async fn learn(
     context: &str,
     provenance: Option<&str>,
     verified: bool,
+    actor: Option<&str>,
 ) -> Result<String> {
     let norm = normalize_error(error);
     if norm.is_empty() || fix.trim().is_empty() {
         anyhow::bail!("mind_learn needs a non-empty error signature and fix");
     }
     let id = storage::add_procedure(config, &norm, context, fix, provenance, verified).await?;
+    // Atlas review: AuditOp::ProcedureAdd was declared but had no producer.
+    crate::audit::record(
+        crate::audit::AuditEvent::new(
+            crate::audit::AuditOp::ProcedureAdd,
+            "_procedures".to_string(),
+            id.clone(),
+        )
+        .actor(actor.unwrap_or("unknown"))
+        .after(format!("error: {norm}\nfix: {fix}"))
+        .note(if verified { "verified" } else { "unverified" }),
+    );
     Ok(format!(
         "Learned procedure [id: {id}]\n  error: {norm}\n  fix:   {fix}\n  verified: {verified} \
          (unverified lessons are surfaced with low weight until a real signal confirms them)"
@@ -160,9 +178,33 @@ fn render(hits: &[ProcedureHit], limit: usize) -> String {
 
 /// Record the outcome of reusing a procedure (self-correction loop). `verify`
 /// promotes to `verified=true` on success — pass it only for a deterministic
-/// signal (test/compile), never a human "seems fine".
-pub async fn outcome(config: &MindConfig, id: &str, worked: bool, verify: bool) -> Result<String> {
+/// signal (test/compile), never a human "seems fine". `actor` is who recorded
+/// it, same convention as `learn`.
+pub async fn outcome(
+    config: &MindConfig,
+    id: &str,
+    worked: bool,
+    verify: bool,
+    actor: Option<&str>,
+) -> Result<String> {
     storage::procedure_outcome(config, id, worked, verify).await?;
+    // Atlas review: AuditOp::ProcedureOutcome was declared but had no producer.
+    crate::audit::record(
+        crate::audit::AuditEvent::new(
+            crate::audit::AuditOp::ProcedureOutcome,
+            "_procedures".to_string(),
+            id.to_string(),
+        )
+        .actor(actor.unwrap_or("unknown"))
+        .note(format!(
+            "worked={worked} verify={verify}{}",
+            if worked && verify {
+                " (now verified)"
+            } else {
+                ""
+            }
+        )),
+    );
     Ok(format!(
         "Recorded outcome for {id}: {}.",
         if worked {

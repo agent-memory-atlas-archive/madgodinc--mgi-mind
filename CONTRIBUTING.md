@@ -23,7 +23,9 @@ Single crate, one binary (`mgimind`). Sources:
 - `src/confidence.rs`: pure §6 / §8 step 8.2 formulas.
 - `src/install_mode.rs`: v1.5 Phase 6 per-mode anchors.
 - `src/outcome.rs`: v1.5 Phase 7 typed external signals.
-- `src/audit.rs`: append-only audit log (every state transition).
+- `src/audit.rs`: append-only audit log. Covers every memory/fact/procedure/
+  skill write, update, delete and quarantine transition, plus consolidate
+  passes; pinned blocks, `kv`, vault, and sessions are not wired into it yet.
 
 ```sh
 cargo build --release            # release binary (~30 MB stripped)

@@ -68,7 +68,7 @@ use serde::{Deserialize, Serialize};
 /// Which Qwen 2.5 weight set to use. Both are Q4_K_M for the same
 /// inference path and the same prompt template; the difference is
 /// parameter count, which trades disk/RAM/quality.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ExtractorVariant {
     /// Qwen 2.5 1.5B Instruct Q4_K_M. ~990 MB on disk, ~1.5 GB RAM.
     /// Faster, weaker multilingual. Suitable for laptops with limited
@@ -77,13 +77,8 @@ pub enum ExtractorVariant {
     /// Qwen 2.5 3B Instruct Q4_K_M. ~1.93 GB on disk, ~2.5 GB RAM.
     /// Default. Recommended for mixed RU+EN+ZH content, including
     /// the author's own base.
+    #[default]
     Default,
-}
-
-impl Default for ExtractorVariant {
-    fn default() -> Self {
-        ExtractorVariant::Default
-    }
 }
 
 impl ExtractorVariant {
@@ -826,10 +821,10 @@ async fn ensure_server(variant: ExtractorVariant) -> anyhow::Result<(u16, String
     let client = reqwest::Client::new();
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
-                return Ok((port, api_key));
-            }
+        if let Ok(resp) = client.get(&url).send().await
+            && resp.status().is_success()
+        {
+            return Ok((port, api_key));
         }
     }
     // Failed health check — shut down the subprocess via the global
