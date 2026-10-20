@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.8.0 (unreleased)
+## 2.8.0 (2026-10-20)
 
 Answers an external code review (neoneye/agent-memory-atlas) of commit
 190d1db, checked against current `main`.
