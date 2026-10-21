@@ -2,7 +2,11 @@
 
 **[English](README.md)** | **[Русский](README.ru.md)** | **[中文](README.zh.md)**
 
-**[Latest release: v2.8.1](https://github.com/madgodinc/mgi-mind/releases/tag/v2.8.1)** · **[CHANGELOG](CHANGELOG.md)** · **[Discussions](https://github.com/madgodinc/mgi-mind/discussions)** · **[Issues](https://github.com/madgodinc/mgi-mind/issues)** · **[Contributing](CONTRIBUTING.md)**
+**[Latest release: v2.8.2](https://github.com/madgodinc/mgi-mind/releases/tag/v2.8.2)** · **[CHANGELOG](CHANGELOG.md)** · **[Discussions](https://github.com/madgodinc/mgi-mind/discussions)** · **[Issues](https://github.com/madgodinc/mgi-mind/issues)** · **[Contributing](CONTRIBUTING.md)**
+
+<p align="center">
+  <a href="https://mcprush.com/madgodinc/mgi-mind-mcp"><img width="380" height="200" src="https://mcprush.com/badge/mgi-mind-mcp/card.svg" alt="MGI-Mind MCP server" loading="lazy" /></a>
+</p>
 
 Local long-term memory for AI assistants. One Rust binary, a local Qdrant
 vector database, local ONNX models. Speaks MCP, so Claude Code and other
@@ -262,6 +266,20 @@ Pydantic AI, the OpenAI Agents SDK, and raw HTTP (any language) are in
 [`docs/integrations`](docs/integrations). MCP and stdio still work for editor
 clients; the HTTP surface is the door for agent frameworks.
 
+### npm (any MCP client)
+
+With Node.js 18 or newer, the npm package installs the prebuilt binary for
+your platform, checked against the release's SHA-256:
+
+```bash
+npx -y mgi-mind init          # creates ~/mgimind
+npx -y mgi-mind doctor --fix  # downloads Qdrant and the models
+claude mcp add mgimind -- npx -y mgi-mind mcp
+```
+
+Other clients take the same command in their MCP config:
+`"command": "npx", "args": ["-y", "mgi-mind", "mcp"]`.
+
 ### Native install
 
 One command. The installer drops the binary on PATH and runs `init` +
@@ -302,7 +320,7 @@ a missing library is telling you about `<install dir>/`, not `~/mgimind/`.
 ### Installer flags
 
 - `INSTALL_DIR=/opt/mgimind curl ... | sh`: install somewhere other than `~/.local/bin`.
-- `MGIMIND_TAG=v2.8.1 curl ... | sh`: pin a specific release instead of `latest`.
+- `MGIMIND_TAG=v2.8.2 curl ... | sh`: pin a specific release instead of `latest`.
 - `SKIP_DOCTOR=1 curl ... | sh`: just drop the binary; run `init` + `doctor --fix` yourself later.
 
 ### Manual install (no installer)
@@ -685,7 +703,7 @@ trust.
 
 ## Status and audit
 
-Current version: **2.8.1** (semver-stable since v1.0.0). The 0.x line built
+Current version: **2.8.2** (semver-stable since v1.0.0). The 0.x line built
 the foundation: the audit log and ephemeral viewer (0.10), the quarantine
 layer and best-effort retrieval policy (0.11), the viewer wave (0.12),
 session liveness (0.13), and procedural memory (0.14, benchmarked on

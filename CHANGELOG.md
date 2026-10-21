@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.8.2 (2026-10-21)
+
+### Added
+
+- **MCP tool annotations.** Every tool in `tools/list` now carries
+  `annotations` with `readOnlyHint`, and for tools that write also
+  `destructiveHint` and `idempotentHint`, plus `openWorldHint`. Clients and
+  catalogs use them to decide which calls need the user's approval: search,
+  listing and reporting tools are read-only; `mind_library`, `mind_block`,
+  `mind_skill`, `mind_quarantine`, `mind_import` and `mind_export` are marked
+  destructive because one of their actions deletes or overwrites; only
+  `mind_web` and `mind_doctor` reach the network. Tool behavior is unchanged.
+
+### Docs
+
+- README: install through npm (`npx -y mgi-mind ...`) for any MCP client, and
+  the mcprush catalog card.
+
 ## 2.8.1 (2026-10-20)
 
 Raises the MCP tool-definition quality (Glama TDQS): rewrote descriptions for
