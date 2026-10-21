@@ -1892,7 +1892,70 @@ fn tool_definitions() -> Vec<Value> {
     // singletons last so a client showing only the first N has a clean view.
     kept.extend(consolidated);
     kept.extend(deprecated);
+    for tool in kept.iter_mut() {
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if let Some(obj) = tool.as_object_mut() {
+            obj.insert("annotations".to_string(), tool_annotations(&name));
+        }
+    }
     kept
+}
+
+/// MCP tool annotations (`readOnlyHint` and friends): the hints a client uses
+/// to decide which calls need the user's approval and how a catalog grades the
+/// tool surface. Every tool works on the local store only, except `mind_web`
+/// (fetches a URL) and `mind_doctor` (with fix=true it downloads components).
+/// A consolidated tool is annotated by its strongest action: `mind_library`
+/// can delete, so the whole tool is destructive.
+fn tool_annotations(name: &str) -> Value {
+    // (read_only, destructive, idempotent, open_world)
+    let (read_only, destructive, idempotent, open_world) = match name {
+        // Search, listing and reporting. mind_consolidate is always a dry-run
+        // here, and the vault tools only explain the terminal command.
+        "mind_search"
+        | "mind_browse"
+        | "mind_recall_all"
+        | "mind_should_search"
+        | "mind_recall"
+        | "mind_history"
+        | "mind_consolidate"
+        | "mind_stats"
+        | "mind_vault"
+        | "mind_vault_store"
+        | "mind_vault_get"
+        | "mind_vault_list"
+        | "mind_fact_query"
+        | "mind_session_last"
+        | "mind_list"
+        | "mind_quarantine_list"
+        | "mind_quarantine_show" => (true, false, true, false),
+        "mind_web" => (false, false, false, true),
+        "mind_doctor" => (false, false, true, true),
+        // Content-addressed or keyed writes: repeating the call changes nothing.
+        "mind_add" | "mind_provenance_add" | "mind_outcome" | "mind_restore" | "mind_create" => {
+            (false, false, true, false)
+        }
+        // Can delete or overwrite: expire, remove, delete, import --apply, and
+        // export writing over existing files.
+        "mind_library" | "mind_delete" | "mind_block" | "mind_skill" | "mind_quarantine"
+        | "mind_import" | "mind_export" => (false, true, false, false),
+        // Every other tool adds or updates records without removing any.
+        _ => (false, false, false, false),
+    };
+    if read_only {
+        json!({ "readOnlyHint": true, "openWorldHint": open_world })
+    } else {
+        json!({
+            "readOnlyHint": false,
+            "destructiveHint": destructive,
+            "idempotentHint": idempotent,
+            "openWorldHint": open_world
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1926,6 +1989,31 @@ mod tests {
             live_surface, 29,
             "non-deprecated surface is 29 tools (20 v1.1 + mind_predicate + mind_outcome + mind_recall_all + mind_should_search + mind_visualize + mind_browse + mind_restore + mind_block + mind_skill)"
         );
+    }
+
+    #[test]
+    fn every_tool_is_annotated() {
+        let tools = tool_definitions();
+        let hint = |name: &str, key: &str| -> Option<bool> {
+            tools
+                .iter()
+                .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
+                .and_then(|t| t["annotations"][key].as_bool())
+        };
+        for t in &tools {
+            assert!(
+                t["annotations"]["readOnlyHint"].is_boolean(),
+                "{} has no readOnlyHint",
+                t["name"]
+            );
+        }
+        assert_eq!(hint("mind_search", "readOnlyHint"), Some(true));
+        assert_eq!(hint("mind_stats", "readOnlyHint"), Some(true));
+        assert_eq!(hint("mind_add", "readOnlyHint"), Some(false));
+        assert_eq!(hint("mind_add", "destructiveHint"), Some(false));
+        assert_eq!(hint("mind_library", "destructiveHint"), Some(true));
+        assert_eq!(hint("mind_web", "openWorldHint"), Some(true));
+        assert_eq!(hint("mind_search", "openWorldHint"), Some(false));
     }
 
     #[test]
